@@ -17,18 +17,25 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import re
+import warnings
 N_PCS=3
 
 
 
 #~~~~~~~~Input reader functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def read_mutation_file(fn) : 
+def read_mutation_file(fn,drop_null_eids=True) : 
     """ Load mutation file (TCGA via cbioportal) """
     import warnings
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
         muts=pd.read_csv(fn,sep='\t')
+        if drop_null_eids :  
+            muts.dropna(subset=['Entrez_Gene_Id'],inplace=True)
+        else : 
+            muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].replace(np.nan,0)
+
+        muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].astype(int)
         return muts
 
 def read_cna_file(fn) : 
@@ -37,7 +44,7 @@ def read_cna_file(fn) :
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
         cnas=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean()
-        cnas=cnas.reindex(cnas.index.dropna())
+        cnas=cnas.reindex(cnas.index.dropna().astype(int))
         cnas.columns.name='sample'
         cnas.index.name='Entrez_Gene_Id'
         return cnas.transpose()
@@ -48,10 +55,10 @@ def read_rna_file(fn) :
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
         hiseq=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean()
-        hiseq=hiseq.reindex(hiseq.index.dropna())
+        hiseq=hiseq.reindex(hiseq.index.dropna().astype(int))
         hiseq.index.name='Entrez_Gene_Id'
         hiseq.columns.name='sample'
-        hiseq=hiseq.drop(columns=['Hugo_Symbol'])
+        #hiseq=hiseq.drop(columns=['Hugo_Symbol'])
         from sklearn.preprocessing import StandardScaler
         hsss=pd.DataFrame(data=StandardScaler().fit_transform(hiseq.transpose()),index=hiseq.columns,columns=hiseq.index)
         return hsss
@@ -66,11 +73,11 @@ def read_fusion_file(fn) :
         syms=np.union1d(fus.Site1_Hugo_Symbol.unique(),fus.Site2_Hugo_Symbol.unique())
         symindices=dict(zip(syms,range(len(syms))))
 
-        eids=np.array([ s2e.get(s,'0') for s in syms ])
+        eids=np.array([ _s2e.get(s,0) for s in syms ])
 
-        fgrid=np.zeros(shape=(len(pats),len(syms),dtype=np.uint32)
+        fgrid=np.zeros(shape=(len(pats),len(syms)),dtype=np.uint32)
         for x,r in fus.iterrows() :
-            pi=patindices[r.Sample_ID]
+            pi=patindices[r.Sample_Id]
             si1=symindices[r.Site1_Hugo_Symbol]
             si2=symindices[r.Site2_Hugo_Symbol]
             fgrid[pi,si1]=1
@@ -79,6 +86,44 @@ def read_fusion_file(fn) :
         dffus=pd.DataFrame(index=pats,columns=eids,data=fgrid)
             
         return dffus
+
+def autoload(tcga_directory) : 
+    muts=read_mutation_file(os.path.join(tcga_directory,'data_mutations.txt'))
+    mpiv=pivot_mutation_events(muts).rename(columns=lambda x : x+'_mut').drop(columns=['0_mut'])
+    cnas=read_cna_file(os.path.join(tcga_directory,'data_log2_cna.txt'))
+    rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt'))
+    fus=read_fusion_file(os.path.join(tcga_directory,'data_sv.txt'))
+    omics=sync_omics(muts,cnas,rnas,fus,logic='intersection')
+
+    ups=define_lesionclass(
+            [
+                omics['rna'],
+                omics['cnas'],
+            ],
+            [
+                lambda x : x > 1.6 ,
+                lambda x : x > 1.6 ,
+            ],'up',min_events_to_keep=2)
+
+    dns=define_lesionclass(
+            [
+                omics['rna'],
+                omics['cnas'],
+            ],
+            [
+                lambda x : x < -1.6 ,
+                lambda x : x < -1.6 ,
+            ],'dn',min_events_to_keep=2)
+
+    fus=define_lesionclass(
+        [ omics['fus'],],
+        [ lambda x : x > 0,],
+        'fus',
+        min_events_to_keep=1)
+
+    td=pd.concat([mpiv,ups,dns,fus],axis=1).fillna(0).astype(int)
+    
+    return td
 
 def load_nest(nestfile) :
     #TODO : rename this, make the new load_nest refer to EIDs
@@ -112,7 +157,7 @@ def arrayify_nest_mask(nest_mask,event_order) :
 
 #~~~~~~~~Transitioning from input data to lesionclasses and burdens~~~~~~~~~~~~~
 
-def sync_omics(muts,cnas,rna,gene_set=None,patients=None,logic='union') :
+def sync_omics(muts,cnas,rna,fus,gene_set=None,patients=None,logic='union') :
     """ Return datasets such that all refer to the same genes and patients.
         If gene_set or patients not provided, use the largest set represented
         in all 3 datasets.
@@ -127,10 +172,13 @@ def sync_omics(muts,cnas,rna,gene_set=None,patients=None,logic='union') :
            'force' : 'force' }.get(logic.lower())
     
     from functools import reduce
-    if gene_set is None: 
-        gene_set=reduce(theop,[np.unique(muts['Entrez_Gene_Id']),cnas.columns,rna.columns])
-    elif theop == 'force' : 
+    if theop == 'force' : 
+        if gene_set is None : 
+            raise ValueError('if logic is "force", then a gene_set must be provided')
         pass ;
+    elif gene_set is None: 
+        gene_set=reduce(theop,[np.unique(muts['Entrez_Gene_Id']),cnas.columns,rna.columns])
+        #RESUME
     else: 
         inargeneset=gene_set
         gene_set=reduce(theop,[gene_set,np.unique(muts['Entrez_Gene_Id']),cnas.columns,rna.columns])
@@ -148,8 +196,9 @@ def sync_omics(muts,cnas,rna,gene_set=None,patients=None,logic='union') :
     patients=np.intersect1d(patients,mutsout['Tumor_Sample_Barcode'].unique())
     cnasout=cnas.reindex(index=patients,columns=gene_set).fillna(0)
     rnaout=rna.reindex(index=patients,columns=gene_set).fillna(0)
+    fusout=fus.reindex(index=patients,columns=gene_set).fillna(0)
     
-    return dict(zip(['muts','cnas','rna'],[mutsout,cnasout,rnaout]))
+    return dict(zip(['muts','cnas','rna','fus'],[mutsout,cnasout,rnaout,fusout]))
 
 def _default_mutation_filter(r) : 
     """
@@ -170,11 +219,12 @@ def pivot_mutation_events(muts,f=_default_mutation_filter,min_events_to_keep=1) 
         
     _muts['theval']=1
         
-    _muts=_muts.drop_duplicates(subset=['Hugo_Symbol','Tumor_Sample_Barcode'],keep='first')\
-            .pivot(index='Tumor_Sample_Barcode',columns='Hugo_Symbol',values='theval').fillna(0)
+    _muts=_muts.drop_duplicates(subset=['Entrez_Gene_Id','Tumor_Sample_Barcode'],keep='first')\
+            .pivot(index='Tumor_Sample_Barcode',columns='Entrez_Gene_Id',values='theval').fillna(0)
 
     _muts.index.name='sample'
-    _muts.columns.name='gene_symbol'
+    _muts.columns.name='gene_id'
+    _muts.columns=_muts.columns.astype(str)
 
     totals=_muts.sum()
     _muts=_muts[ totals[ totals > 0 ].index ]
@@ -198,7 +248,7 @@ def define_lesionclass(frames,filters,suffix,logic='and',min_events_to_keep=1) :
         elif logic.upper() == 'OR' : 
             ma=ma | filters[i](frames[i])
                    
-    ma=ma.rename(columns= lambda s : s+'_'+suffix)
+    ma=ma.rename(columns= lambda s : str(s)+'_'+suffix)
     if min_events_to_keep :
         ma=ma.loc[:,ma.sum(axis=0).gt(min_events_to_keep)]
     return ma
@@ -394,8 +444,8 @@ def _get_geneinfo() :
     gi=pd.read_csv(GENEINFOPATH,sep='\t')
     return gi
 
-_gi=_get_geneinfo(GENEINFOPATH)
-_s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(str).values))
+_gi=_get_geneinfo()
+_s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(int).values))
 
 def annotate_map_locations(raw_model_stats_df) :
     """
