@@ -21,7 +21,6 @@ import re
 import warnings
 N_PCS=3
 
-
 #~~~~~~~~Input reader functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def read_mutation_file(fn,drop_null_eids=True) : 
@@ -482,6 +481,9 @@ def _fit_single_lesionclass(patients,y,lesionclass) :
     return pd.Series(proto_outser)
         
 
+    print('alpha :',1/estimator.C,'k:',nparams,'ll:',bigll)
+    return -1*aic
+
 class LogitTransformer(object) : 
     """
     Generates a function to simulate events from a (patients x burdens) array 
@@ -492,7 +494,6 @@ class LogitTransformer(object) :
         self.hasbeenfit=False
         self.training_data=training_data
         self.patients=None
-        self.bigC=None
 
     def __call__(self,patient_lburdens) : 
         if not self.hasbeenfit : 
@@ -568,7 +569,6 @@ class LogitTransformer(object) :
                 nnz_relationships,pnz_relationships,hit_features,discarded_features))
 
         return logit_data
-
 
    #def _fit_single_lesionclass(self,lesionclass) : 
 

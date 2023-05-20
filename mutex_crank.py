@@ -25,8 +25,6 @@ n_repeats=int(ns.n_repeats)
 cu=cohort.upper()
 cl=cohort.lower()
 
-#wdir=opj(cwd,)
-
 logit_data=pd.read_csv(opj(wdir,'logit_data.csv'),index_col=0)
 import pickle
 with open(opj(wdir,'logittransformer.pickle'),'rb') as f : 
