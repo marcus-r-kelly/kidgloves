@@ -167,6 +167,7 @@ rst=pd.DataFrame(protorst[protorst_metacols])
 rst=rst.assign(**{ cgk : [ ( r[list(cg)] != 0 ).sum() for x,r in protorst.iterrows() ]
                              for cgk,cg in colgroups.items() })
 rst=rst.assign(**{ 'n_explanations' : [ rst.loc[x,list(colgroups.keys())].sum() for x in rst.index ] })
+rst.to_csv(opj(outpath,'explanation_summaries.csv'))
 print('Done.')
 
 
