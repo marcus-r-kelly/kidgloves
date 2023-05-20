@@ -42,7 +42,8 @@ class Adder(mp.Process) :
             weight=tritup[1]
             data=tritup[2]
 
-            kind=filename.split('_')[-1].split('.')[0]
+            #kind=filename.split('_')[-1].split('.')[0]
+            kind=filename.split('_')[1]
             if not kind in alldata : 
                 alldata.update({ kind : data })
                 totalweight.update({ kind : weight })
@@ -68,13 +69,16 @@ jobs=[ fp for fp in os.listdir(target) if fp.endswith('.txt')]
 from tqdm.auto import tqdm
 import os
 
-with mp.Pool(processes=16) as p :
-    #foo=[ x for x in p.imap_unordered(reader,jobs) ]
+with mp.Pool(processes=len(os.sched_getaffinity(0))) as p :
+    #foo=[ x for x in p.imap_unordered(reader,jobs[:30]) ]
     foo=[ x for x in p.imap_unordered(reader,jobs) ]
+
 midQ.put((None,))
 print('Done reading, closing processes.')
 refined=outQ.get()
 adder.join() # processes won't join until all associated queues are empty
+
+print('Reading model info...')
 
 import pickle
 logit_data=pd.read_csv(target+'/logit_data.csv',index_col=0)
@@ -89,6 +93,7 @@ nsystems=len(systemkeys)
 events=logit_data.lesion_class.values
 nevents=logit_data.shape[0]
 
+print('Reformating count data')
 gg=refined['gg'].reshape((nevents,nevents))
 sg=refined['gs'].reshape((nevents,nsystems))
 ss=refined['ss'].reshape((nsystems,nsystems))
@@ -109,6 +114,7 @@ dfggm=dfgg.reset_index().melt(id_vars='eventA',var_name='eventB',value_name='p')
 dfsgm=dfsg.reset_index().melt(id_vars='event',var_name='system',value_name='p')
 dfssm=dfss.reset_index().melt(id_vars='systemA',var_name='systemB',value_name='p').query('systemA <= systemB')
 
+print('Printing count data')
 dfggm.to_csv(target+'/gg.csv')
 dfsgm.to_csv(target+'/sg.csv')
 dfssm.to_csv(target+'/ss.csv')

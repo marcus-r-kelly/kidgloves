@@ -35,7 +35,7 @@ def read_mutation_file(fn,drop_null_eids=True) :
         else : 
             muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].replace(np.nan,0)
 
-        muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].astype(int)
+        muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].astype(int).astype(str)
         return muts
 
 def read_cna_file(fn) : 
@@ -44,7 +44,8 @@ def read_cna_file(fn) :
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
         cnas=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean()
-        cnas=cnas.reindex(cnas.index.dropna().astype(int))
+        cnas=cnas.reindex(cnas.index.dropna())
+        cnas.index=cnas.index.astype(int).astype(str)
         cnas.columns.name='sample'
         cnas.index.name='Entrez_Gene_Id'
         return cnas.transpose()
@@ -55,11 +56,13 @@ def read_rna_file(fn) :
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
         hiseq=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean()
-        hiseq=hiseq.reindex(hiseq.index.dropna().astype(int))
+        hiseq=hiseq.reindex(hiseq.index.dropna())
+        hiseq.index=hiseq.index.astype(int).astype(str)
         hiseq.index.name='Entrez_Gene_Id'
         hiseq.columns.name='sample'
         #hiseq=hiseq.drop(columns=['Hugo_Symbol'])
         from sklearn.preprocessing import StandardScaler
+        hiseq=hiseq.reset_index().groupby('Entrez_Gene_Id').mean()
         hsss=pd.DataFrame(data=StandardScaler().fit_transform(hiseq.transpose()),index=hiseq.columns,columns=hiseq.index)
         return hsss
 
@@ -67,13 +70,13 @@ def read_fusion_file(fn) :
     """ Load gene fusion calls (TCGA via cbioportal) """
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
-        fus=pd.read_csv(fn,sep='\t')
+        fus=pd.read_csv(fn,sep='\t',index_col=False)
         pats=fus.Sample_Id.unique()
         patindices=dict(zip(pats,range(len(pats))))
         syms=np.union1d(fus.Site1_Hugo_Symbol.unique(),fus.Site2_Hugo_Symbol.unique())
         symindices=dict(zip(syms,range(len(syms))))
 
-        eids=np.array([ _s2e.get(s,0) for s in syms ])
+        eids=np.array([ _s2e.get(s,'0') for s in syms ])
 
         fgrid=np.zeros(shape=(len(pats),len(syms)),dtype=np.uint32)
         for x,r in fus.iterrows() :
@@ -83,17 +86,28 @@ def read_fusion_file(fn) :
             fgrid[pi,si1]=1
             fgrid[pi,si2]=1
 
-        dffus=pd.DataFrame(index=pats,columns=eids,data=fgrid)
+        dffus=pd.DataFrame(index=pats,columns=eids,data=fgrid).drop(columns=['0'])
             
         return dffus
 
-def autoload(tcga_directory) : 
+def autoload(tcga_directory,gene_set=None): 
     muts=read_mutation_file(os.path.join(tcga_directory,'data_mutations.txt'))
-    mpiv=pivot_mutation_events(muts).rename(columns=lambda x : x+'_mut').drop(columns=['0_mut'])
+    #mpiv=pivot_mutation_events(muts).rename(columns=lambda x : x+'_mut').drop(columns=['0_mut'])
     cnas=read_cna_file(os.path.join(tcga_directory,'data_log2_cna.txt'))
-    rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt'))
+    #rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_normal_samples.txt'))
+    rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_diploid_samples.txt'))
+    #rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt'))
     fus=read_fusion_file(os.path.join(tcga_directory,'data_sv.txt'))
-    omics=sync_omics(muts,cnas,rnas,fus,logic='intersection')
+    if not gene_set : 
+        omics=sync_omics(muts,cnas,rnas,fus,logic='intersection',gene_set=gene_set)
+    else : 
+        omics=sync_omics(muts,cnas,rnas,fus,logic='force',gene_set=gene_set)
+
+    return omics
+
+def autoload_events(tcga_directory,gene_set=None,heuristic=True) : 
+    omics=autoload(tcga_directory,gene_set=gene_set)
+    mpiv=pivot_mutation_events(omics['muts']).rename(columns=lambda x : x+'_mut')
 
     ups=define_lesionclass(
             [
@@ -101,7 +115,7 @@ def autoload(tcga_directory) :
                 omics['cnas'],
             ],
             [
-                lambda x : x > 1.6 ,
+                lambda x : x > 1.6 , # formerly both 1.6
                 lambda x : x > 1.6 ,
             ],'up',min_events_to_keep=2)
 
@@ -111,8 +125,8 @@ def autoload(tcga_directory) :
                 omics['cnas'],
             ],
             [
-                lambda x : x < -1.6 ,
-                lambda x : x < -1.6 ,
+                lambda x : x < -1 , # formerly both 1.6, this is after inspection of CDK2NA in lung cancer
+                lambda x : x < -1 ,
             ],'dn',min_events_to_keep=2)
 
     fus=define_lesionclass(
@@ -122,24 +136,33 @@ def autoload(tcga_directory) :
         min_events_to_keep=1)
 
     td=pd.concat([mpiv,ups,dns,fus],axis=1).fillna(0).astype(int)
+
+    if heuristic and td.shape[1] >= 3*td.shape[0]:  
+        omic_incidence=td.sum().sort_values(ascending=False)
+        omicfloor=omic_incidence.iloc[3*td.shape[0]]
+        td=td[ td.columns[td.sum().ge(omicfloor)]]
     
     return td
 
 def load_nest(nestfile) :
-    #TODO : rename this, make the new load_nest refer to EIDs
     """ Load NeST from the csv exported from cytoscape """
     df=pd.read_csv(nestfile).fillna('') ;
     return df
 
 def extract_nest_systems(nestdf) :
     """ Creates an annotation: {gene,} dict from nest table """
-    return { r.Annotation : set(r.Genes.split(' ')) 
-            for x,r in nestdf.iterrows ()}
+    return { r['shared name'] : set(r.Genes.split(' ')) - {'',}
+            for x,r in nestdf.iterrows ()} 
 
 def mask_nest_systems(nest_dict,logit_df) : 
     """ Creates an annotation: {lesionclass,} dict from nest table """
     return { k : logit_df[ logit_df.gene.isin(v) ].lesion_class.values for k,v in 
             nest_dict.items() if logit_df.gene.isin(v).any() }
+
+def mask_nest_systems_from_omics(nest_dict,omics_df) : 
+    getgene=lambda s : s.split('_')[0]
+    return { k : { c for c in omics_df.columns
+                   if getgene(c) in nest_dict[k] } for k in nest_dict }
 
 def arrayify_nest_mask(nest_mask,event_order) : 
     """ Creates an lc x s dok matrix mapping events to systems.
@@ -193,10 +216,14 @@ def sync_omics(muts,cnas,rna,fus,gene_set=None,patients=None,logic='union') :
         
     mutsout=muts.query('Tumor_Sample_Barcode in @patients and Entrez_Gene_Id in @gene_set')
     #ATTENTION TO THESE LINES--- CAN CAUSE DROPPING OF SOME DOZENS OF PATIENTS
-    patients=np.intersect1d(patients,mutsout['Tumor_Sample_Barcode'].unique())
-    cnasout=cnas.reindex(index=patients,columns=gene_set).fillna(0)
-    rnaout=rna.reindex(index=patients,columns=gene_set).fillna(0)
-    fusout=fus.reindex(index=patients,columns=gene_set).fillna(0)
+    import warnings
+    with warnings.catch_warnings() :
+        warnings.simplefilter("error")
+
+        patients=np.intersect1d(patients,mutsout['Tumor_Sample_Barcode'].unique())
+        cnasout=cnas.reindex(index=patients,columns=gene_set).fillna(0)
+        rnaout=rna.reindex(index=patients,columns=gene_set).fillna(0)
+        fusout=fus.reindex(index=patients,columns=gene_set).fillna(0)
     
     return dict(zip(['muts','cnas','rna','fus'],[mutsout,cnasout,rnaout,fusout]))
 
@@ -227,7 +254,7 @@ def pivot_mutation_events(muts,f=_default_mutation_filter,min_events_to_keep=1) 
     _muts.columns=_muts.columns.astype(str)
 
     totals=_muts.sum()
-    _muts=_muts[ totals[ totals > 0 ].index ]
+    _muts=_muts[ totals[ totals >= min_events_to_keep ].index ]
 
     return _muts.reindex(index=muts['Tumor_Sample_Barcode'].unique()).fillna(0)
     
@@ -305,7 +332,34 @@ def load_transformer(filename) :
         outdata=dill.load(f)
     return outdata
 
+from sklearn.pipeline import make_pipeline
+
 class CohortTransformer(object) : 
+
+    def __init__(self,n_pcs=N_PCS)  :
+        self.pca=PCA(n_pcs)
+        self.ss=StandardScaler()
+        self.pl=make_pipeline(self.ss,self.pca)
+        self.hasbeenfit=False
+
+    def fit(self,signatures) :
+        self.pl.fit(signatures)
+        self.hasbeenfit=True
+        #self.ss.fit(comboburden) ;
+        #self.pca.fit(omics) ;
+
+    def save(self,filename) : 
+        with open(filename,'wb') as f  : 
+            dill.dump(self,f) ;
+
+    def transform(self,signatures) :
+        if not self.hasbeenfit : 
+            print('CohortTransformer has not been fit.')
+            return
+
+        return self.pl.transform(signatures)
+
+class _CohortTransformer_arm(object) : 
 
     def __init__(self)  :
         self.hsgi=_get_geneinfo()[['Symbol','map_location','type_of_gene']]
@@ -353,25 +407,29 @@ class CohortTransformer(object) :
         combonormburden=pd.DataFrame(data=self.ss.transform(comboburden),index=comboburden.index,columns=comboburden.columns) ;
         return combonormburden
         
-def _assemble_logit_model_from_params(logit_data_series):
-    # is there a way I can lasso this?
-    from sklearn.linear_model import LogisticRegression
-    lr=LogisticRegression()
-    lr.classes_=np.array([0,1])
-    lr.coef_=np.array([[ logit_data_series[c] for c in logit_data_series.index if c.startswith('coef') ]])
-    lr.intercept_=np.array([logit_data_series.intercept])
-    return lr
+_metacols=['intercept','accuracy','lesion_class','lesion_overclass','gene']
+
+def logit_aic_scorer(estimator,X,ytru) : 
+    probs=estimator.predict_proba(X=X)[:,1] # a(x) in your formulation
+    lls=ytru*np.log(probs)+(1-ytru)*np.log(1-probs)
+    bigll=lls.sum()
+    nparams=((estimator.coef_ != 0.0).sum()+1)
+    aic=2*nparams-2*bigll
+    print('alpha :',1/estimator.C,'k:',nparams,'ll:',bigll)
+    return -1*aic
 
 class LogitTransformer(object) : 
     """
     Generates a function to simulate events from a (patients x burdens) array 
     by applying a probabilistic (logit) model for a given number of events
     """
-    def __init__(self,training_data=None) : 
+    def __init__(self,training_data=None,bigC=0.1,penalty='elasticnet') : 
         super().__init__() ;
         self.hasbeenfit=False
         self.training_data=training_data
         self.patients=None
+        self.bigC=bigC
+        self.penalty=penalty
 
     def __call__(self,patient_lburdens) : 
         if not self.hasbeenfit : 
@@ -387,6 +445,13 @@ class LogitTransformer(object) :
     #def analytical_freq(self,patient_lburdens=self.patients) :
         #eventprobs=np.stack([ lm.predict_proba(patient_lburdens)[:,1] for lm in self.logit_models ],axis=-1)
         #return 
+    def _assemble_logit_model_from_params(self,logit_data_series):
+        from sklearn.linear_model import LogisticRegression
+        lr=LogisticRegression(C=self.bigC,penalty=self.penalty)
+        lr.classes_=np.array([0,1])
+        lr.coef_=np.array([[ logit_data_series[c] for c in logit_data_series.index if c not in _metacols ]])
+        lr.intercept_=np.array([logit_data_series.intercept])
+        return lr
 
     def fit(self,patients,parallel=True) : 
         self.patients=patients
@@ -399,22 +464,32 @@ class LogitTransformer(object) :
         else :
             logit_data=pd.DataFrame([ self._fit_single_lesionclass(c) for c in self.training_data.columns])
 
-        self.logit_models=[ _assemble_logit_model_from_params(r) for x,r in logit_data.iterrows() ]
-        print('BigC was 0.1,penalty was l1,saga solver')
+        self.logit_models=[ self._assemble_logit_model_from_params(r) for x,r in logit_data.iterrows() ]
+        print('BigC was {},penalty was {},saga solver'.format(self.bigC,self.penalty))
         self.hasbeenfit=True
+        ctable=logit_data[logit_data.columns[ ~logit_data.columns.isin(_metacols) ]]
+        nnz_relationships=( ctable !=0 ).sum().sum()
+        pnz_relationships=100*nnz_relationships/np.prod(ctable.shape)
+        hit_features=( ctable !=0 ).any().sum()
+        discarded_features=( ctable ==0 ).all().sum()
+        print('# nonzero relationships {}\n% nonzero relationships {}\n# used features {}\n# discarded features {}'.format(
+                nnz_relationships,pnz_relationships,hit_features,discarded_features))
 
         return logit_data
 
     def _fit_single_lesionclass(self,lesionclass) :
-        lr=LogisticRegression(solver='saga',penalty='l1',max_iter=1000,C=0.1)
-        # above was used 2/28
+        #l1_ratio=0.15 if self.penalty=='elasticnet' else None
+        #lr=LogisticRegression(solver='saga',penalty=self.penalty,max_iter=1000,C=self.bigC,l1_ratio=l1_ratio)
+        # above was used 5/15
         #lr=LogisticRegression(solver='saga',penalty='l2',max_iter=1000,C=None)
+        lr=LogisticRegression(solver='saga',penalty='l1',max_iter=1000,C=0.3)
         lr.fit(self.patients,self.training_data[lesionclass])
         gene,lesion_overclass=lesionclass.split('_')
 
         coefs=lr.coef_[0,:]
 
-        proto_outser=dict(zip(['coef'+str(x) for x in range(len(coefs))],coefs))
+        #proto_outser=dict(zip(['coef'+str(x) for x in range(len(coefs))],coefs))
+        proto_outser=dict(zip(self.patients.columns,coefs))
         proto_outser.update({
             'intercept' : lr.intercept_[0] ,
             'accuracy' : lr.score(self.patients,self.training_data[lesionclass]) , 
@@ -445,7 +520,8 @@ def _get_geneinfo() :
     return gi
 
 _gi=_get_geneinfo()
-_s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(int).values))
+_s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(int).astype(str).values))
+_e2s=dict(zip(_gi.GeneID.astype(int).astype(str).values,_gi.Symbol.values))
 
 def annotate_map_locations(raw_model_stats_df) :
     """

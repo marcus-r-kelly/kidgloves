@@ -10,13 +10,21 @@ n_repeats=int(sys.argv[3])
 cu=cohort.upper()
 cl=cohort.lower()
 
-logit_data=pd.read_csv(cu+'/'+'logit_data.csv',index_col=0)
+import os
+opj=os.path.join
+cwd=os.getcwd()
+wdir=opj(cwd,cu+'_epistasis')
+
+logit_data=pd.read_csv(opj(wdir,'logit_data.csv'),index_col=0)
 import pickle
-with open(cu+'/'+'logittransformer.pickle','rb') as f : 
+with open(opj(wdir,'logittransformer.pickle'),'rb') as f : 
     logittransformer=pickle.load(f) 
 
-with open(cu+'/'+'nestmaskdict.pickle','rb') as f : 
+with open(opj(wdir,'nestmaskdict.pickle'),'rb') as f : 
     nestmaskdict=pickle.load(f)
+
+print('~~~~~~~~~Read in dumped cohort objects~~~~~~~~~~~~~~~~~~~~~~')
+sys.stdout.flush()
 
 import torch
 import torch.sparse
@@ -43,40 +51,58 @@ truX=(truSE-truW)
 
 truGG=np.dot(logittransformer.training_data.values.transpose(),logittransformer.training_data.values)
 
+print('~~~~~~~~~Prepared true coincidence objects~~~~~~~~~~~~~~~~~~')
+sys.stdout.flush()
 
-with open(cu+'/'+'_'.join([task_id,'ss'])+'.txt','w') as ss : 
- with open(cu+'/'+'_'.join([task_id,'gs'])+'.txt','w') as gs : 
-  with open(cu+'/'+'_'.join([task_id,'gg'])+'.txt','w') as gg : 
+with   open(opj(wdir,'_'.join([task_id,'ss','counts']))+'.txt','w') as ss : 
+ with  open(opj(wdir,'_'.join([task_id,'gs','counts']))+'.txt','w') as gs : 
+  with open(opj(wdir,'_'.join([task_id,'gg','counts']))+'.txt','w') as gg : 
 
     for x in range(n_repeats) : 
+        print('~~~~~~~~~Cranking, repeat {:0>4}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~'.format(x))
+        sys.stdout.flush()
         pat_gen=kg._ShC_generator(logittransformer.patients,mvsize)
 
         multiverselist=[ logittransformer(j) for j in pat_gen ]
         multiverse=sptops.sparse_tensor_from_index_array_iter(multiverselist,logittransformer.training_data.shape).to(torch.float32)
 
+        print('    Generating mega singleton/event tensors')
+        sys.stdout.flush()
         megaR=sptops.diag_embed(multiverse,minorly=True).coalesce() # gene-gene mutation mapping by individual
         megaL=sptops.bmm(megaR,nestmask_sparse) # system-gene mutation mapping by individual
         megaQ=sptops.clip(sptops.bmm(megaL.transpose(2,3).coalesce(),megaL)) # system coincidences attributable to single mutations
         megaS=sptops.clip(sptops.bmm(multiverse,nestmask_sparse)) # systems mutated by individual
         megaM=sptops.bmm(megaS.transpose(2,1).coalesce(),megaS)  # multiverse-wide system coincidence
 
+        print('    Densifying mega singleton/event tensors')
+        sys.stdout.flush()
         megaMcounts=megaM.to_dense().numpy() #densification of system coincidence
-        megaQcounts=megaQ.to_dense().numpy().sum(axis=1) #densification of system coincidence attributable to single events
+        #megaQcounts=megaQ.to_dense().numpy().sum(axis=1) #densification of system coincidence attributable to single events
+        megaQcounts=torch.sparse.sum(megaQ,1).to_dense().numpy() #densification of system coincidence attributable to single events
         obsdmv=megaMcounts-megaQcounts #singleton-corrected coincidence counts
 
 
-        megaW=megaL.to_dense().numpy().sum(axis=1) #system-event coincidences attributable to event within system
+        print('    Handling   mega system/event tensors')
+        sys.stdout.flush()
+        megaW=torch.sparse.sum(megaL,1).to_dense().numpy() #system-event coincidences attributable to event within system
+        #megaW=megaL.to_dense().numpy().sum(axis=1) #system-event coincidences attributable to event within system
         megaSE=sptops.bmm(multiverse.transpose(1,2),megaS) # system-event coincidences
         megaX=(megaSE.to_dense()-megaW).numpy() # corrected system-event coincidences
 
+        print('    Handling   mega event/event tensors')
+        sys.stdout.flush()
         megaGG=sptops.bmm(multiverse.transpose(1,2),multiverse).to_dense().numpy()
 
+        print('    Counting and appending...')
+        sys.stdout.flush()
         sscounts=(( obsdmv == tru_ss_obs ).astype(int) + 2*(obsdmv<tru_ss_obs).astype(int)).sum(axis=0)
         secounts=(( megaX == truX ).astype(int) + 2*(megaX<truX).astype(int)).sum(axis=0)
         ggcounts=(( megaGG == truGG ).astype(int) + 2*(megaGG<truGG).astype(int)).sum(axis=0)
 
         print(str(int(mvsize)*2)+','+','.join(np.cast['str'](np.cast['int'](sscounts.ravel()))),file=ss)
         print(str(int(mvsize)*2)+','+','.join(np.cast['str'](np.cast['int'](secounts.ravel()))),file=gs)
+
+
         print(str(int(mvsize)*2)+','+','.join(np.cast['str'](np.cast['int'](ggcounts.ravel()))),file=gg)
                 
 
