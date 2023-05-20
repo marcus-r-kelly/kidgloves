@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
@@ -19,7 +20,6 @@ from sklearn.preprocessing import StandardScaler
 import re
 import warnings
 N_PCS=3
-
 
 
 #~~~~~~~~Input reader functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -212,7 +212,7 @@ def sync_omics(muts,cnas,rna,fus,gene_set=None,patients=None,logic='union') :
     if patients is None : 
         
         patients=reduce(np.intersect1d,[np.unique(muts['Tumor_Sample_Barcode']),cnas.index,rna.index])
-        print(len(patients))
+        print(len(patients),'patients')
         
     mutsout=muts.query('Tumor_Sample_Barcode in @patients and Entrez_Gene_Id in @gene_set')
     #ATTENTION TO THESE LINES--- CAN CAUSE DROPPING OF SOME DOZENS OF PATIENTS
@@ -407,7 +407,7 @@ class _CohortTransformer_arm(object) :
         combonormburden=pd.DataFrame(data=self.ss.transform(comboburden),index=comboburden.index,columns=comboburden.columns) ;
         return combonormburden
         
-_metacols=['intercept','accuracy','lesion_class','lesion_overclass','gene']
+_metacols=['intercept','bigC','accuracy','n_events','lesion_class','lesion_overclass','gene']
 
 def logit_aic_scorer(estimator,X,ytru) : 
     probs=estimator.predict_proba(X=X)[:,1] # a(x) in your formulation
@@ -415,21 +415,84 @@ def logit_aic_scorer(estimator,X,ytru) :
     bigll=lls.sum()
     nparams=((estimator.coef_ != 0.0).sum()+1)
     aic=2*nparams-2*bigll
-    print('alpha :',1/estimator.C,'k:',nparams,'ll:',bigll)
     return -1*aic
+
+import multiprocessing as mp
+#from sklearn.model_selection import GridSearchCV,ShuffleSplit
+from sklearn.model_selection import GridSearchCV,StratifiedShuffleSplit
+from sklearn.linear_model import LogisticRegression
+
+class LogitHandler(mp.Process) : 
+    def __init__(self,patients,training_data,taskQ,resultQ) : 
+        super().__init__()
+        self.patients=patients
+        self.training_data=training_data
+        self.taskQ=taskQ
+        self.resultQ=resultQ
+
+    def run(self) : 
+        while True : 
+            lesionclass=self.taskQ.get()
+            if lesionclass is None :
+                break
+
+            result=_fit_single_lesionclass(self.patients,self.training_data[lesionclass],lesionclass)
+            self.resultQ.put(result)
+        return
+
+def _fit_single_lesionclass(patients,y,lesionclass) : 
+    gene,lesion_overclass=lesionclass.split('_')
+
+    with warnings.catch_warnings() : 
+        warnings.simplefilter('ignore')
+        os.environ['PYTHONWARNINGS']='ignore'
+
+        bigCs=10**np.arange(-2.0,4.01,0.5)
+        if sum(y) >= 3 : 
+            search_params=dict(C=bigCs)
+            gscv=GridSearchCV(
+                    LogisticRegression(solver='saga',penalty='l1',max_iter=100)
+                    ,search_params,
+                    n_jobs=1,
+                    cv=StratifiedShuffleSplit(n_splits=3,train_size=0.8),
+                    scoring=logit_aic_scorer)
+            gscv.fit(patients,y)
+            bestmodel=gscv.best_estimator_
+        else: 
+            bestnaic=0
+            bestmodel=None
+            for bigC in bigCs : 
+                estimator=LogisticRegression(penalty='l1',solver='saga',C=bigC,max_iter=100)
+                estimator.fit(patients,y)
+                naic=logit_aic_scorer(estimator,patients,y)
+                if naic > bestnaic or bestnaic == 0 : 
+                    bestnaic=naic
+                    bestmodel=estimator
+
+    proto_outser=dict(zip(patients.columns,bestmodel.coef_[0]))
+    proto_outser.update({
+        'intercept' : bestmodel.intercept_[0] ,
+        'bigC'      : bestmodel.C,
+        'accuracy' : bestmodel.score(patients,y) , 
+        'lesion_class' : lesionclass, 
+        'lesion_overclass' : lesion_overclass,
+        'n_events' : (y != 0).sum(),
+        'gene' : gene })
+
+    return pd.Series(proto_outser)
+        
 
 class LogitTransformer(object) : 
     """
     Generates a function to simulate events from a (patients x burdens) array 
     by applying a probabilistic (logit) model for a given number of events
     """
-    def __init__(self,training_data=None,bigC=0.1,penalty='elasticnet') : 
+    def __init__(self,training_data=None) : 
         super().__init__() ;
         self.hasbeenfit=False
         self.training_data=training_data
         self.patients=None
-        self.bigC=bigC
-        self.penalty=penalty
+        self.bigC=None
 
     def __call__(self,patient_lburdens) : 
         if not self.hasbeenfit : 
@@ -447,7 +510,7 @@ class LogitTransformer(object) :
         #return 
     def _assemble_logit_model_from_params(self,logit_data_series):
         from sklearn.linear_model import LogisticRegression
-        lr=LogisticRegression(C=self.bigC,penalty=self.penalty)
+        lr=LogisticRegression(C=logit_data_series.bigC)
         lr.classes_=np.array([0,1])
         lr.coef_=np.array([[ logit_data_series[c] for c in logit_data_series.index if c not in _metacols ]])
         lr.intercept_=np.array([logit_data_series.intercept])
@@ -456,16 +519,45 @@ class LogitTransformer(object) :
     def fit(self,patients,parallel=True) : 
         self.patients=patients
 
+        print('Fitting logit models ',end='')
+        sys.stdout.flush()
+
         if parallel and NPROCESSORS > 2 : 
-            from pathos.multiprocessing import ProcessPool
-            with ProcessPool(nodes=NPROCESSORS) as p: 
-                logit_data=pd.DataFrame(p.map(self._fit_single_lesionclass,self.training_data.columns))
+                print('in parallel mode with {} processors '.format(NPROCESSORS),end='\n')
+                sys.stdout.flush()
+
+                taskQ=mp.Queue()
+                resultQ=mp.Queue()
+                processpool=[ LogitHandler(self.patients,self.training_data,taskQ,resultQ) for x in range(NPROCESSORS) ]
+                for p in processpool : p.start() ;
+                for c in self.training_data.columns : taskQ.put(c)
+                for p in processpool : taskQ.put(None)
+
+                ldd=list()
+                for x,c in enumerate(self.training_data.columns) : 
+                    ldd.append(resultQ.get())
+                    print('{: >8} of {: >8} events fitted.'.format(x,self.training_data.shape[1]),end='\r')
+                    sys.stdout.flush()
+                print('{: >8} of {: >8} events fitted.'.format(x+1,self.training_data.shape[1]),end='\n')
+
+                logit_data=pd.DataFrame(ldd)
+                #logit_data=pd.DataFrame([ resultQ.get() for c in self.training_data.columns ])
+                for p in processpool : p.join()
 
         else :
-            logit_data=pd.DataFrame([ self._fit_single_lesionclass(c) for c in self.training_data.columns])
+            print('in linear mode with {} processors '.format(NPROCESSORS),end='')
+            sys.stdout.flush()
+            logit_data=pd.DataFrame([ _fit_single_lesionclass(self.patients,self.training_data[c],c) for c in self.training_data.columns])
 
+        print('Done.')
+        sys.stdout.flush()
+
+        print('Assembling storable logit models...',end='')
+        sys.stdout.flush()
         self.logit_models=[ self._assemble_logit_model_from_params(r) for x,r in logit_data.iterrows() ]
-        print('BigC was {},penalty was {},saga solver'.format(self.bigC,self.penalty))
+        print('Done')
+        sys.stdout.flush()
+
         self.hasbeenfit=True
         ctable=logit_data[logit_data.columns[ ~logit_data.columns.isin(_metacols) ]]
         nnz_relationships=( ctable !=0 ).sum().sum()
@@ -477,30 +569,66 @@ class LogitTransformer(object) :
 
         return logit_data
 
-    def _fit_single_lesionclass(self,lesionclass) :
-        #l1_ratio=0.15 if self.penalty=='elasticnet' else None
-        #lr=LogisticRegression(solver='saga',penalty=self.penalty,max_iter=1000,C=self.bigC,l1_ratio=l1_ratio)
-        # above was used 5/15
-        #lr=LogisticRegression(solver='saga',penalty='l2',max_iter=1000,C=None)
-        lr=LogisticRegression(solver='saga',penalty='l1',max_iter=1000,C=0.3)
-        lr.fit(self.patients,self.training_data[lesionclass])
-        gene,lesion_overclass=lesionclass.split('_')
 
-        coefs=lr.coef_[0,:]
+   #def _fit_single_lesionclass(self,lesionclass) : 
 
-        #proto_outser=dict(zip(['coef'+str(x) for x in range(len(coefs))],coefs))
-        proto_outser=dict(zip(self.patients.columns,coefs))
-        proto_outser.update({
-            'intercept' : lr.intercept_[0] ,
-            'accuracy' : lr.score(self.patients,self.training_data[lesionclass]) , 
-            #   remember to change this!
-            'lesion_class' : lesionclass, 
-            'lesion_overclass' : lesion_overclass,
-            'gene' : gene })
+   #    gene,lesion_overclass=lesionclass.split('_')
 
-        outser=pd.Series(proto_outser)
-        
-        return outser
+   #    bigCs=10**np.arange(-3.0,3.01,0.25)
+   #    bestnaic=0
+   #    bestmodel=None
+   #    with warnings.catch_warnings() : 
+   #        warnings.simplefilter('ignore')
+   #        os.environ['PYTHONWARNINGS']='ignore'
+
+   #        for bigC in bigCs : 
+   #            estimator=LogisticRegression(penalty='l1',solver='saga',C=bigC,max_iter=1000)
+   #            estimator.fit(self.patients,self.training_data[lesionclass])
+   #            naic=logit_aic_scorer(estimator,self.patients,self.training_data[lesionclass])
+   #            if naic > bestnaic or bestnaic == 0 : 
+   #                bestnaic=naic
+   #                bestmodel=estimator
+
+   #    coefs=bestmodel.coef_[0,:]
+
+   #    proto_outser=dict(zip(self.patients.columns,coefs))
+   #    proto_outser.update({
+   #        'intercept' : bestmodel.intercept_[0] ,
+   #        'bigC'      : bestmodel.C,
+   #        'accuracy' : bestmodel.score(self.patients,self.training_data[lesionclass]) , 
+   #        #   remember to change this!
+   #        'lesion_class' : lesionclass, 
+   #        'lesion_overclass' : lesion_overclass,
+   #        'n_events' : (self.training_data[lesionclass] != 0).sum(),
+   #        #TODO why is this not showing up
+   #        'gene' : gene })
+
+   #    return pd.Series(proto_outser)
+
+#   def _fit_single_lesionclass(self,lesionclass) :
+#       #l1_ratio=0.15 if self.penalty=='elasticnet' else None
+#       #lr=LogisticRegression(solver='saga',penalty=self.penalty,max_iter=1000,C=self.bigC,l1_ratio=l1_ratio)
+#       # above was used 5/15
+#       #lr=LogisticRegression(solver='saga',penalty='l2',max_iter=1000,C=None)
+#       lr=LogisticRegression(solver='saga',penalty='l1',max_iter=1000,C=0.3)
+#       lr.fit(self.patients,self.training_data[lesionclass])
+#       gene,lesion_overclass=lesionclass.split('_')
+
+#       coefs=lr.coef_[0,:]
+
+#       #proto_outser=dict(zip(['coef'+str(x) for x in range(len(coefs))],coefs))
+#       proto_outser=dict(zip(self.patients.columns,coefs))
+#       proto_outser.update({
+#           'intercept' : lr.intercept_[0] ,
+#           'accuracy' : lr.score(self.patients,self.training_data[lesionclass]) , 
+#           #   remember to change this!
+#           'lesion_class' : lesionclass, 
+#           'lesion_overclass' : lesion_overclass,
+#           'gene' : gene })
+
+#       outser=pd.Series(proto_outser)
+#       
+#       return outser
 
     def save(self,filename) : 
         with open(filename,'wb') as f  : 
