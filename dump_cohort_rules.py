@@ -1,7 +1,6 @@
 import numpy as np
 import sys
 import pandas as pd
-import kidgloves as kg
 from functools import reduce,partial
 import yaml
 import os
@@ -67,6 +66,8 @@ cbioportal_path=opj(kgc['cbioportal_folder_prefix'],cl+'_tcga_pan_can_atlas_2018
 NEST_HIERARCHY_PATH=kgc['nest_hierarchy_path']
 #TODO: this needs to get  moved into its own script that saves the signature/arm frame
 # then, that frame needs to be read and pointed to in this script
+
+import kidgloves as kg
 #~~~~~~~~Read in and format omics signatures~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 print('Loading signatures...',end='')
 if cu == 'COADREAD' : 
@@ -103,7 +104,7 @@ print('Done.')
 print('Reading in lesions...',end='')
 CBIOPORTAL_PATH=opj(kgc['cbioportal_folder_prefix'],cl+'_tcga_pan_can_atlas_2018')
 preomics=kg.autoload_events(CBIOPORTAL_PATH,gene_set=list(nest_genes))
-preomics.index=[ '-'.join(x.split('-')[:-1]) for x in preomics.index]
+preomics.index=[ '-'.join(x.split('-')[:3]) for x in preomics.index]
 omics=preomics.reindex(msigframe.index).fillna(0)
 omics=omics[ omics.columns[omics.sum().ne(0)]]
 print('Done.')
