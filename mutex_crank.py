@@ -14,6 +14,7 @@ parser.add_argument('--task_id',action='store',help='number to designate this co
 parser.add_argument('--n_repeats',action='store',default=100,help='Number of multiverses to generate')
 parser.add_argument('--mvsize',action='store',default=100,help='Number of simulated cohorts in each multiverse')
 parser.add_argument('--config_file',action='store',default=opj(os.getenv('HOME'),'.config','kgconfig.yaml'),help='location of desired kgconfig file')
+parser.add_argument('--noise_model',action='store_true',default=False,help='Pass this flag to sample patients using a 10-class BayesianGaussianMixture. If False/unset[default], will resample from existing patients')
 
 ns=parser.parse_args()
 
@@ -71,7 +72,10 @@ with   open(opj(wdir,'_'.join([task_id,'ss','counts']))+'.txt','w') as ss :
     for x in range(n_repeats) : 
         print('~~~~~~~~~Cranking, repeat {:0>4}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~'.format(x))
         sys.stdout.flush()
-        pat_gen=kg._ShC_generator(logittransformer.patients,mvsize)
+        if ns.noise_model : 
+            pat_gen=kg._BGf_generator(logittransformer.patients,mvsize)
+        else : 
+            pat_gen=kg._ShC_generator(logittransformer.patients,mvsize)
 
         multiverselist=[ logittransformer(j) for j in pat_gen ]
         multiverse=sptops.sparse_tensor_from_index_array_iter(multiverselist,logittransformer.training_data.shape).to(torch.float32)

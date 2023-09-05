@@ -1,12 +1,13 @@
 import sys
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
+#from matplotlib import pyplot as plt
 #%matplotlib inline
-import seaborn as sb
-import palettable
-sb.set(context='notebook',style='whitegrid',palette=palettable.cartocolors.qualitative.Safe_10.hex_colors)
+#import seaborn as sb
+#import palettable
+#sb.set(context='notebook',style='whitegrid',palette=palettable.cartocolors.qualitative.Safe_10.hex_colors)
 import os
+opj=os.path.join
 NPROCESSORS=len(os.sched_getaffinity(0))
 import scipy.sparse
 from scipy.sparse import dok_matrix,issparse
@@ -19,7 +20,16 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import re
 import warnings
+import yaml
 N_PCS=3
+
+_config=None
+
+def read_config(path=opj(os.getenv('HOME'),'.config','kgconfig.yaml')): 
+    global _config
+    with open(path,'r') as y : 
+        _config=yaml.safe_load(y)
+
 
 #~~~~~~~~Input reader functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -447,26 +457,26 @@ def _fit_single_lesionclass(patients,y,lesionclass) :
         os.environ['PYTHONWARNINGS']='ignore'
 
         bigCs=10**np.arange(-2.0,4.01,0.5)
-        if sum(y) >= 3 : 
-            search_params=dict(C=bigCs)
-            gscv=GridSearchCV(
-                    LogisticRegression(solver='saga',penalty='l1',max_iter=100)
-                    ,search_params,
-                    n_jobs=1,
-                    cv=StratifiedShuffleSplit(n_splits=3,train_size=0.8),
-                    scoring=logit_aic_scorer)
-            gscv.fit(patients,y)
-            bestmodel=gscv.best_estimator_
-        else: 
-            bestnaic=0
-            bestmodel=None
-            for bigC in bigCs : 
-                estimator=LogisticRegression(penalty='l1',solver='saga',C=bigC,max_iter=100)
-                estimator.fit(patients,y)
-                naic=logit_aic_scorer(estimator,patients,y)
-                if naic > bestnaic or bestnaic == 0 : 
-                    bestnaic=naic
-                    bestmodel=estimator
+       #if sum(y) >= 3 : 
+       #    search_params=dict(C=bigCs)
+       #    gscv=GridSearchCV(
+       #            LogisticRegression(solver='saga',penalty='l1',max_iter=100)
+       #            ,search_params,
+       #            n_jobs=1,
+       #            cv=StratifiedShuffleSplit(n_splits=3,train_size=0.8),
+       #            scoring=logit_aic_scorer)
+       #    gscv.fit(patients,y)
+       #    bestmodel=gscv.best_estimator_
+       #else: 
+        bestnaic=0
+        bestmodel=None
+        for bigC in bigCs : 
+            estimator=LogisticRegression(penalty='l1',solver='saga',C=bigC,max_iter=100)
+            estimator.fit(patients,y)
+            naic=logit_aic_scorer(estimator,patients,y)
+            if naic > bestnaic or bestnaic == 0 : 
+                bestnaic=naic
+                bestmodel=estimator
 
     proto_outser=dict(zip(patients.columns,bestmodel.coef_[0]))
     proto_outser.update({
@@ -686,6 +696,16 @@ def annotate_system_sharing(frame,nest_mask,columns=['event_a','event_b']) :
 import scipy.sparse
 import numpy.random
 _rng=numpy.random.default_rng()
+
+def _BGf_generator(patient_lburdens,multiverse_size) :
+    from sklearn.mixture import BayesianGaussianMixture
+    bu_a=patient_lburdens.values
+    bgm=BayesianGaussianMixture(n_components=10)
+    bgm.fit(patient_lburdens.values)
+    for x in range(multiverse_size) : 
+        I=bgm.sample(patient_lburdens.shape[0])[0]
+        _rng.shuffle(I,axis=0)
+        yield I
 
 def _ShC_generator(patient_lburdens,multiverse_size) :
     """

@@ -22,7 +22,7 @@ parser.add_argument(
 parser.add_argument(
         '--output_path',
         action='store',
-        help='suffix to append to output folder; that is, outputfolder will be <cohort_lower>_<cohort_suffix>',
+        help='output folder',
         required=True)
 
 parser.add_argument(
