@@ -21,6 +21,8 @@ from sklearn.preprocessing import StandardScaler
 import re
 import warnings
 import yaml
+
+import hier
 N_PCS=3
 
 _config=None
@@ -114,7 +116,7 @@ def autoload(tcga_directory,gene_set=None):
 
     return omics
 
-def autoload_events(tcga_directory,gene_set=None,heuristic=True) : 
+def autoload_events(tcga_directory,gene_set=None,heuristic=3,n2keep=2) : 
     omics=autoload(tcga_directory,gene_set=gene_set)
     mpiv=pivot_mutation_events(omics['muts']).rename(columns=lambda x : x+'_mut')
 
@@ -126,7 +128,7 @@ def autoload_events(tcga_directory,gene_set=None,heuristic=True) :
             [
                 lambda x : x > 1.6 , # formerly both 1.6
                 lambda x : x > 1.6 ,
-            ],'up',min_events_to_keep=2)
+            ],'up',min_events_to_keep=n2keep)
 
     dns=define_lesionclass(
             [
@@ -136,7 +138,7 @@ def autoload_events(tcga_directory,gene_set=None,heuristic=True) :
             [
                 lambda x : x < -1 , # formerly both 1.6, this is after inspection of CDK2NA in lung cancer
                 lambda x : x < -1 ,
-            ],'dn',min_events_to_keep=2)
+            ],'dn',min_events_to_keep=n2keep)
 
     fus=define_lesionclass(
         [ omics['fus'],],
@@ -146,9 +148,13 @@ def autoload_events(tcga_directory,gene_set=None,heuristic=True) :
 
     td=pd.concat([mpiv,ups,dns,fus],axis=1).fillna(0).astype(int)
 
-    if heuristic and td.shape[1] >= 3*td.shape[0]:  
+    # the heuristic is only invoked if there are 3 times as many features as patients
+    if heuristic and td.shape[1] >= heuristic*td.shape[0]:  
         omic_incidence=td.sum().sort_values(ascending=False)
-        omicfloor=omic_incidence.iloc[3*td.shape[0]]
+        omicfloor=omic_incidence.iloc[heuristic*td.shape[0]]
+        # the heuristic sets a floor at the event count the 3xn ranked event
+        # all events with that many or greater counts are taken
+        print('Omic floor set at',omicfloor)
         td=td[ td.columns[td.sum().ge(omicfloor)]]
     
     return td
@@ -169,23 +175,44 @@ def mask_nest_systems(nest_dict,logit_df) :
             nest_dict.items() if logit_df.gene.isin(v).any() }
 
 def mask_nest_systems_from_omics(nest_dict,omics_df) : 
-    getgene=lambda s : s.split('_')[0]
-    return { k : { c for c in omics_df.columns
-                   if getgene(c) in nest_dict[k] } for k in nest_dict }
+    nmo=dict()
+    omics_columns_as_genes=np.array([ s.split('_')[0] for s in omics_df.columns ])
+    for k in nest_dict : 
+        nmo.update({ k : set(omics_df.columns[
+                                    np.argwhere(
+                                        np.isin(omics_columns_as_genes,list(nest_dict[k]))
+                                    ).ravel()]) })
 
-def arrayify_nest_mask(nest_mask,event_order) : 
+    return nmo
+        
+    #getgene=lambda s : s.split('_')[0]
+    #return { k : { c for c in omics_df.columns
+                   #if getgene(c) in nest_dict[k] } for k in nest_dict }
+
+def arrayify_nest_mask(nest_mask,event_order,tensorize=True) : 
     """ Creates an lc x s dok matrix mapping events to systems.
         To avoid weirdness,keys of the nest mask are sorted. """ 
-    events=[ e for e in event_order ]
-    systems=[ s for s in sorted(nest_mask.keys()) ]
+    events=np.array([ e for e in event_order ])
+    systems=np.array([ s for s in sorted(nest_mask.keys()) ])
 
-    #tf
-    #return tf.convert_to_tensor([
-            #[ int(e in nest_mask[s]) for s in systems ]
-            #for e in events ])
-    return torch.tensor([
-            [ np.int32(e in nest_mask[s]) for s in systems ]
-            for e in events ])
+    nma=np.zeros((len(systems),len(events)),dtype=np.int32)
+    indices_to_change=np.argwhere([ np.isin(events,list(nest_mask[s]))
+                    for s in systems ])
+    nma[indices_to_change[:,0],indices_to_change[:,1]]=1
+    nma=nma.transpose()
+
+    if tensorize :
+        return torch.tensor(nma) 
+    else : return nma
+    
+
+   ##tf
+   ##return tf.convert_to_tensor([
+   #        #[ int(e in nest_mask[s]) for s in systems ]
+   #        #for e in events ])
+   #return torch.tensor([
+   #        [ np.int32(e in nest_mask[s]) for s in systems ]
+   #        for e in events ])
 
 #~~~~~~~~Transitioning from input data to lesionclasses and burdens~~~~~~~~~~~~~
 

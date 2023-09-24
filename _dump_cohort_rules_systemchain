@@ -32,29 +32,14 @@ parser.add_argument(
         help='location of desired kgconfig file')
 
 parser.add_argument(
-        '--n_to_keep',
+        '--max_nest_system_size',
         action='store',
-        default=2,
-        help='minimum events to keep')
-
-parser.add_argument(
-    '--heuristic',
-    action='store_true',
-    help="Whether or not to use the keeping heuristic. If set, then the 'n_to_keep' argument refers to rank-multiples")
-    
-
-
-   #parser.add_argument(
-   #        '--max_nest_system_size',
-   #        action='store',
-   #        default=50,
-   #        help='Largest system size to allow when pulling hierarchy data')
+        default=50,
+        help='Largest system size to allow when pulling hierarchy data')
 
 ns=parser.parse_args()
 
 cohort_signature_table=ns.cohort_signature_table
-n2keep=int(ns.n_to_keep)
-
 outpath=ns.output_path
 cohort=ns.cohort
 cu=cohort.upper()
@@ -70,7 +55,7 @@ with open(ns.config_file,'r') as y :
 
 assert os.path.isdir(kgc.get('cbioportal_folder_prefix'))
 assert os.path.isdir(kgc.get('signature_folder_prefix'))
-#assert os.path.exists(kgc.get('nest_hierarchy_path'))
+assert os.path.exists(kgc.get('nest_hierarchy_path'))
 
 #casedatapath=opj(kgc['signature_folder_prefix'],'casedata')
 #aliquotpath=opj(casedatapath,'aliquot.tsv')
@@ -79,7 +64,7 @@ thiscohortpath=opj(kgc['signature_folder_prefix'],'cohort_'+cl)
 cbioportal_path=opj(kgc['cbioportal_folder_prefix'],cl+'_tcga_pan_can_atlas_2018')
 
 
-#NEST_HIERARCHY_PATH=kgc['nest_hierarchy_path']
+NEST_HIERARCHY_PATH=kgc['nest_hierarchy_path']
 #TODO: this needs to get  moved into its own script that saves the signature/arm frame
 # then, that frame needs to be read and pointed to in this script
 #~~~~~~~~Read in and format omics signatures~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -94,35 +79,30 @@ print('Done.')
 
 
 
-   ##~~~~~~~~Read in the relevant parts of nest~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-   #print('Reading in hierarchy...',end='')
-   #nestdf=kg.load_nest(kgc['nest_hierarchy_path'])
-   ##nestdf=nestdf[ nestdf['Size'].le(50) & nestdf['No. significantly mutated cancer types'].ge(1) ]
-   #nestdf=nestdf[nestdf['Size'].le(int(ns.max_nest_system_size)) & 
-   #    (nestdf['Significantly mutated cancer types'].str.contains(thisnestcancer)  | nestdf['No. significantly mutated cancer types'].ge(2)) ]
+#~~~~~~~~Read in the relevant parts of nest~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+print('Reading in hierarchy...',end='')
+nestdf=kg.load_nest(kgc['nest_hierarchy_path'])
+#nestdf=nestdf[ nestdf['Size'].le(50) & nestdf['No. significantly mutated cancer types'].ge(1) ]
+nestdf=nestdf[nestdf['Size'].le(int(ns.max_nest_system_size)) & 
+    (nestdf['Significantly mutated cancer types'].str.contains(thisnestcancer)  | nestdf['No. significantly mutated cancer types'].ge(2)) ]
 
-   #   #nest_cancer_types={ ct for ctl in nestdf['Significantly mutated cancer types'].values for ct in ctl.split(' ')} -{'',} 
-   #   #if cl == "coadread"  : 
-   #   #    nestdf=nestdf[ nestdf['Size'].le(50) & nestdf['Significantly mutated cancer types'].str.contains("COAD") ]
-   #   #elif cl not in nest_cancer_types : 
-   #   #    nestdf=nestdf[ nestdf['Size'].le(50) ]
-   #   #else : 
-   #   #    nestdf=nestdf[ nestdf['Size'].le(50) & nestdf['Significantly mutated cancer types'].str.contains(cu) ]
+   #nest_cancer_types={ ct for ctl in nestdf['Significantly mutated cancer types'].values for ct in ctl.split(' ')} -{'',} 
+   #if cl == "coadread"  : 
+   #    nestdf=nestdf[ nestdf['Size'].le(50) & nestdf['Significantly mutated cancer types'].str.contains("COAD") ]
+   #elif cl not in nest_cancer_types : 
+   #    nestdf=nestdf[ nestdf['Size'].le(50) ]
+   #else : 
+   #    nestdf=nestdf[ nestdf['Size'].le(50) & nestdf['Significantly mutated cancer types'].str.contains(cu) ]
 
-   #nest=kg.extract_nest_systems(nestdf)
-   #nest_genes={ g for s in nest.values() for g in s }
-   #nest_genes=nest_genes - {'',}
-   #print('Done.')
+nest=kg.extract_nest_systems(nestdf)
+nest_genes={ g for s in nest.values() for g in s }
+nest_genes=nest_genes - {'',}
+print('Done.')
 
 #~~~~~~~~Read in and transform cancer data~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 print('Reading in lesions...',end='')
 CBIOPORTAL_PATH=opj(kgc['cbioportal_folder_prefix'],cl+'_tcga_pan_can_atlas_2018')
-#preomics=kg.autoload_events(CBIOPORTAL_PATH,gene_set=list(nest_genes))
-if ns.heuristic : 
-    preomics=kg.autoload_events(CBIOPORTAL_PATH,heuristic=n2keep)
-else : 
-    preomics=kg.autoload_events(CBIOPORTAL_PATH,heuristic=False,n2keep=n2keep)
-
+preomics=kg.autoload_events(CBIOPORTAL_PATH,gene_set=list(nest_genes))
 preomics.index=[ '-'.join(x.split('-')[:-1]) for x in preomics.index]
 omics=preomics.reindex(msigframe.index).fillna(0)
 omics=omics[ omics.columns[omics.sum().ne(0)]]
@@ -153,9 +133,9 @@ print('Done.')
 
 #~~~~~~~~Finally, we need to grab the relevant nest systems~~~~~~~~~~~~~~~~~~~~~
 print('Summarizing...',end='')
-#nestmaskdict=kg.mask_nest_systems(nest,logit_data)
-#with open(opj(outpath,'nestmaskdict.pickle'),'wb') as f : 
-    #pickle.dump(nestmaskdict,f)
+nestmaskdict=kg.mask_nest_systems(nest,logit_data)
+with open(opj(outpath,'nestmaskdict.pickle'),'wb') as f : 
+    pickle.dump(nestmaskdict,f)
 
 
 protorst=pd.DataFrame(logit_data)
