@@ -115,14 +115,11 @@ class LARGeSSE_G(object) :
             hierarchy, # filename, dict, array, tensor
             omics, # dataframe
             signatures, # dataframe
-            loglengths, # Series - by EID
-            timing_coordinates, #Series - by EID
             samplefactor=0.95,
             hierarchy_max_members=2000,
             hierarchy_name=None,
             hierarchy_features=None,
-            j_stringency=1e-2,
-            kongweight=None,
+            j_stringency=1e-2
             ) :
         super(LARGeSSE_G,self).__init__()
 
@@ -148,27 +145,8 @@ class LARGeSSE_G(object) :
 
         self.sigscale=MaxAbsScaler().fit_transform(self.signatures) 
         # this should tbh be unnecessary when loaded from a pickled logittransformer
-        _jbase=getJ(self.omics,self.sigscale,correlation_p=self.j_stringency).astype(np.float32)
+        _j=getJ(self.omics,self.sigscale,correlation_p=self.j_stringency).astype(np.float32)
 
-        lld=dict(zip(loglengths.index,loglengths.values))
-        llmean=loglengths.mean()
-        lls=pd.Series(
-                        data=MaxAbsScaler().fit_transform(
-                            np.array([ lld.get(e.split('_')[0],llmean) for e in self.omics.columns ]).reshape(-1,1)).ravel() ,
-                        index=self.omics.columns,
-                        )
-            
-        rcd=dict(zip(timing_coordinates.index,timing_coordinates.values))
-
-        timing_coordinates= pd.Series(
-                                    data=MaxAbsScaler().fit_transform(np.array([ rcd.get(e.split('_')[0],llmean) for e in self.omics.columns ]).reshape(-1,1)).ravel(),
-                                    index=self.omics.columns,
-                            )
-
-        intercept=-1*np.ones((omics.shape[1],))
-
-        _j=np.c_[_jbase,lls,timing_coordinates,intercept]
-        
         self.y=np.log10(omics.sum(axis=0)+1)
 
         self.getfeaturetype=np.vectorize(self._gft)
@@ -180,15 +158,11 @@ class LARGeSSE_G(object) :
                 _hdict=kg.qunpickle(hierarchy)
                 if not self.hierarchy_name : 
                     self.hierarchy_name=hierarchy.split(os.sep)[-1].split('.')[0]
-
             else : 
                 _hdict=hierarchy
 
-            if len(_hdict) > 0 : 
-                _nmo=kg.mask_nest_systems_from_omics(_hdict,omics)
-                _h=kg.arrayify_nest_mask(_nmo,omics.columns).numpy() 
-            else : 
-                _h=np.zeros((omics.columns.shape[0],0))
+            _nmo=kg.mask_nest_systems_from_omics(_hdict,omics)
+            _h=kg.arrayify_nest_mask(_nmo,omics.columns).numpy() 
             self.hierarchy_features=sorted(list(_hdict.keys()))
             if hierarchy_features is not None : 
                 warnings.warn('Since features are provided as dictionary keys, hierarchy names passed via __init__() are ignored')
@@ -229,22 +203,7 @@ class LARGeSSE_G(object) :
         self.I=self.X.view()[:,:_i.shape[1]]
         self.H=self.X.view()[:,_i.shape[1]:(-1*_j.shape[1])]
 
-
-
-        if kongweight is None :
-            self.kongweight=0
-        else: 
-            self.kongweight=kongweight
-
-        kwv=self.get_kwv()
-
-        self.U = self.X*kwv
-
-        self.features=np.array( list(self.genes)+
-                                list(self.hierarchy_features)+
-                                list(self.signatures.columns)+
-                                ['log_length','timing_coordinate','intercept']
-                                )
+        self.features=np.array(list(self.genes)+list(self.hierarchy_features)+list(self.signatures.columns))
 
     def set_random_seed(self,seed) :
         if type(seed) == str : 
@@ -278,31 +237,8 @@ class LARGeSSE_G(object) :
             subcc=getJ(thisomics,thissig)
             return thisy,np.concatenate([self.I,self.J,subcc],axis=1)[:,fslice]
         else : 
-            return thisy,self.U.view()[:,fslice]
+            return thisy,self.X.view()[:,fslice]
 
-    def get_kwv(self) : 
-        # the kong weight is the log10-relative weight of hierarchy values
-        # over signature values, excluding the final three columns which
-        # are not tumor properties but gene properties
-        ngenesys=len(self.genes)+len(self.hierarchy_features)
-        nsig=len(self.signatures.columns)
-
-        lkw=np.exp(np.log(10)*self.kongweight)
-
-        weightscale=((lkw*np.ones((ngenesys,))).sum()+
-                    (lkw*np.ones((nsig,))).sum())/(ngenesys+nsig)
-
-        genesysvalues=lkw/weightscale
-        sigvalues=1/weightscale
-
-        kwv=np.r_[np.ones((ngenesys,))*genesysvalues,
-                  np.ones((nsig,))*sigvalues,
-                  np.ones((3,))]
-        return kwv
-
-    def update_kongweight(self,kongweight) : 
-        self.kongweight=kongweight
-        self.U=self.X*self.get_kwv()
 
     def _gft(self,s) : 
         if s in self.genes : 
@@ -313,14 +249,14 @@ class LARGeSSE_G(object) :
 
     def copy(self) : 
         return LARGeSSE_G(
-                            hierarchy=self.H, # filename, dict, array, tensor
-                            omics=self.omics, # dataframe
-                            signatures=self.signatures, # dataframe
-                            samplefactor=self.samplefactor,
-                            hierarchy_max_members=self.hierarchy_max_members,
-                            hierarchy_name=self.hierarchy_name,
-                            hierarchy_features=self.hierarchy_features,
-                            j_stringency=self.j_stringency
+                        hierarchy=self.H, # filename, dict, array, tensor
+                        omics=self.omics, # dataframe
+                        signatures=self.signatures, # dataframe
+                        samplefactor=self.samplefactor,
+                        hierarchy_max_members=self.hierarchy_max_members,
+                        hierarchy_name=self.hierarchy_name,
+                        hierarchy_features=self.hierarchy_features,
+                        j_stringency=self.j_stringency
                         ) ;
 
 
@@ -341,10 +277,10 @@ def burn_in(lg,folds=5,n_repeats=15,log=True,alpharange=_default_alpharange) :
     kf=RepeatedKFold(n_splits=folds,random_state=int('0xc0ffee',16),n_repeats=n_repeats)
     with warnings.catch_warnings() : 
         warnings.simplefilter('ignore')  
-        for i,(tr,te) in enumerate(kf.split(lg.U)) : 
+        for i,(tr,te) in enumerate(kf.split(lg.X)) : 
             if log : lmsg(lg,i,lrtime,starttime)
             lrtime=time.time()
-            mse,thisalphas,thiscoefs=_do_burnin_burning(lg.U,lg.y,tr,te)
+            mse,thisalphas,thiscoefs=_do_burnin_burning(lg.X,lg.y,tr,te)
             if mse is not None : 
               mses.append(mse)
               alphas.append(thisalphas)
@@ -395,7 +331,106 @@ def _do_burnin_wrapup(mses,alphas,coefs) :
                 burninca,
                 burnindf)
 
+class _paraburn_patsy(mp.Process) : 
+    def __init__(self,lg,inQ,resultQ,affinity=None) : 
+        super(_paraburn_patsy,self).__init__()
+        self.inQ=inQ
+        self.resultQ=resultQ
+        self.X=lg.X.copy()
+        self.y=lg.y.copy()
+        self.affinity=affinity
+
+    def run(self) :
+        #print(self.name,'beginning main loop')
+        #sys.stdout.flush()
+        if not self.affinity is None:
+            os.sched_setaffinity(os.getpid(),self.affinity)
+
+        with warnings.catch_warnings() : 
+            warnings.simplefilter('ignore')
+            while True : 
+                qresult=self.inQ.get()
+                #print(self.name,'received indices')
+                #sys.stdout.flush()
+                if qresult is None : 
+                    #print(self.name,'poison-pilled')
+                    sys.stdout.flush()
+                    break
+                tr,te=qresult
+                mse,thisalphas,thiscoefs=_do_burnin_burning(self.X,self.y,tr,te)
+                #print(self.name,'completed loop, submitting goods')
+                #sys.stdout.flush()
+                self.resultQ.put((mse,thisalphas,thiscoefs))
+                #print(self.name,'submitted goods.')
+                #sys.stdout.flush()
+            #print(self.name,'exited loop')
+            #sys.stdout.flush()
+
 import threadpoolctl
+def paraburn(lg,folds=5,n_repeats=15,log=True,alpharange=_default_alpharange,n_thralls=None) : 
+    #previous_blas=os.environ.get('OPENBLAS_NUM_THREADS','')
+    #previous_mkl=os.environ.get('MKL_NUM_THREADS','')
+    #previous_omp=os.environ.get('OPENMP_NUM_THREADS')
+    cpus=len(os.sched_getaffinity(0))
+    if n_thralls is None : 
+        n_thralls=int(cpus//10)
+
+    #os.environ['OPENBLAS_NUM_THREADS']=str(int(cpus//n_thralls))
+    #os.environ['MKL_NUM_THREADS']=str(int(cpus//n_thralls))
+
+    inQ=mp.Queue()
+    outQ=mp.Queue()
+
+    print('Spawning...')
+    #patsypool=[ _paraburn_patsy(lg,inQ,outQ) for x in range(n_thralls) ]
+    patsypool=[ _paraburn_patsy(lg,inQ,outQ) for x in tqdm(range(n_thralls),total=n_thralls) ]
+    for patsy in patsypool : 
+        patsy.start()
+
+    print('Seeding...')
+    kf=RepeatedKFold(n_splits=folds,random_state=int('0xc0ffee',16),n_repeats=n_repeats)
+    nsplits=0
+    #for tup in kf.split(lg.X) : 
+    for tup in tqdm(kf.split(lg.X),total=folds*n_repeats) : 
+        time.sleep(1) # stagger starts because there is a large thread allocation at the beginning
+        inQ.put(tup)
+        nsplits +=1 
+
+    for patsy in patsypool : 
+        inQ.put(None)
+
+    mses=list()
+    alphas=list()
+    coefs=list()
+    print('Running...')
+    for n in tqdm(range(nsplits),total=nsplits): 
+    #for n in range(nsplits): 
+        outtup=outQ.get()
+        if outtup[0] is None : continue
+        mses.append(outtup[0])
+        alphas.append(outtup[1])
+        coefs.append(outtup[2])
+
+    for patsy in patsypool : 
+        patsy.join()
+
+    burninca=np.concatenate(coefs,axis=1)
+    burninalphas=np.concatenate(alphas,axis=0)
+    burninmses=np.concatenate(mses,axis=0)
+    burninsplits=np.array([ x for x,c in enumerate(alphas) for _ in c ])
+
+    burnindf=pd.DataFrame(index=np.arange(len(burninsplits))).assign(
+        alpha=burninalphas,
+        lalpha=np.log10(burninalphas),
+        mse=burninmses,
+        split=burninsplits)
+
+    #os.environ['OPENBLAS_NUM_THREADS']=previous_blas
+    #os.environ['MKL_NUM_THREADS']=previous_mkl
+    return BurnInResult(
+            burninca,
+            burnindf)
+
 
 def qpickle(obj,fname) : 
     with open(fname,'wb') as f : 
@@ -615,39 +650,6 @@ def get_earliest_discovery(bir) :
         earliest_discovery.append( rr[ mask].min() )
 
     return np.array(earliest_discovery)
-
-acconly=np.vectorize(lambda x : x.split('.')[0])
-eidonly=np.vectorize(lambda x : x.split('_')[0])
-
-def load_protein_datas() : 
-    #TODO : customize script to accommodate different timings
-
-    if kg._s2e is None : 
-        kg._get_geneinfo()
-
-    acconly=np.vectorize(lambda x : x.split('.')[0])
-    eidonly=np.vectorize(lambda x : x.split('_')[0])
-
-    grh=pd.read_csv('/cellar/users/mrkelly/Data/canon/ncbi_reference/gene2refseq_human.tsv',
-            names=['taxid','GeneID','status','msg_acc','msg_gi','protein_acc','protein_gi','genomic','genoimc_gi','gstart','gend','strand','assembly','matpep_acc','matpep_gi','Symbol'],
-            sep='\t')
-    pi=pd.read_csv('/cellar/users/mrkelly/Data/canon/ncbi_reference/genpept/pept_info',sep='\t',index_col=0)
-    pi=pi.assign(acc=acconly(pi['id'].values))
-    grh=grh.assign(GeneID=grh.GeneID.astype(str),acc=acconly(grh.protein_acc))
-    fr=grh[['GeneID','acc']].merge(pi[['acc','length']],on='acc')
-    fgb=fr.groupby('GeneID').length.max()
-
-    rt=pd.read_csv('/cellar/users/mrkelly/Data/canon/replication_timing/Gene_Replication_Timing_Normalized_Density.txt',sep='\t')
-    rt['GeneID']=rt.gene_name.apply(kg._s2e.get).astype(str)
-    bins=rt[ rt.columns[rt.columns.str.startswith('bin')] ]
-    _,cc=np.indices(bins.shape)
-    wbins=cc*bins
-    waverage=np.sum(wbins,axis=1)/np.sum(bins,axis=1)
-    rt['coord']=waverage
-
-    return np.log10(fgb),rt.set_index('GeneID').coord
-
-
     
 if __name__ == '__main__' : 
 
@@ -667,10 +669,6 @@ if __name__ == '__main__' :
     if not os.path.exists(outpath) : 
         os.mkdir(outpath)
 
-    msg('Reading in gene data',end='')
-    lengths,coord=load_protein_datas()
-    msg('Done.')
-
     #~~~~~~~~Read in hierarchy and omics~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
@@ -678,13 +676,7 @@ if __name__ == '__main__' :
     msg(f"Reading in omics from LUAD COHORT...",end='')
     with warnings.catch_warnings() : 
         warnings.simplefilter('ignore')
-        lg=lt_to_lg(hpath,
-            kg.opj(rules,'logittransformer.pickle'),
-            loglengths=lengths,
-            timing_coordinates=coord,
-            j_stringency=j_stringency,
-            
-)
+        lg=lt_to_lg(hpath,kg.opj(rules,'logittransformer.pickle'),j_stringency=j_stringency)
     lg.samplefactor=sample_factor
     lg.j_stringency=j_stringency
     msg('Done.')
@@ -695,13 +687,13 @@ if __name__ == '__main__' :
     bxdf=pd.DataFrame(data=lg.X,index=lg.omics.columns,columns=lg.features)
 
 
-
     #~~~~~~~~BURN-IN analysis~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # the goal is to get an estimate of alpha  for this hierarchy
     # as well as to define the space of coefficients actually being tested
 
 
     msg("Running burn-in analysis...",end='')
+    #bir=paraburn(lg)
     bir=burn_in(lg,n_repeats=bir_repeats)
     with open(opj(outpath,'burnin.pickle'),'wb') as f: 
         pickle.dump(bir,f)
@@ -716,17 +708,15 @@ if __name__ == '__main__' :
     crundata=burnin_dissection(bir)
     crundata.to_csv(opj(outpath,'burnin_dissection.csv'))
     msg("Done.")
-
-    np.savez(opj(outpath,'ofinterest_i.npz'),ofinterest_i)
     #.....................................................................
 
     #~~~~~~~~Main analysis~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     msg("Performing main run...",end='')
     coremodel=LassoLars(alpha=alpha_empir,positive=True,fit_intercept=False)
-    coremodel.fit(lg.U[:,ofinterest_i],lg.y)
-    #ofinterest_i2=ofinterest_i[coremodel.coef_ > 0]
+    coremodel.fit(lg.X[:,ofinterest_i],lg.y)
+    ofinterest_i2=ofinterest_i[coremodel.coef_ > 0]
 
-    mr=mainrun(lg,alpha_empir,ofinterest_i,n_runs=n_repeats)
+    mr=mainrun(lg,alpha_empir,ofinterest_i2,n_runs=n_repeats)
     with open(opj(outpath,'mainrun.pickle'),'wb') as f : 
         pickle.dump(mr,f)
     with open(opj(outpath,'coremodel.pickle'),'wb') as f : 
@@ -735,10 +725,9 @@ if __name__ == '__main__' :
     #.....................................................................
 
     #~~~~~~~~Bootstrapping for nonzero value and confidence interval~~~~~~
-    msg("Skipping post-run analysis [WIP]. Done.")
-    #msg("Performing post-run analysis...",end='')
-    #pra=post_run_analysis(lg,ofinterest_i,mr,alpha_theor,php=php)
-    #pra.to_csv(opj(outpath,'post_run_analysis.csv'))
-    #msg("Done.")
+    msg("Performing post-run analysis...",end='')
+    pra=post_run_analysis(lg,ofinterest_i2,mr,alpha_theor,php=php)
+    pra.to_csv(opj(outpath,'post_run_analysis.csv'))
+    msg("Done.")
     #.....................................................................
 

@@ -157,21 +157,3 @@ def jmerge(nh,minsimilarity,debug=False) :
 
     return newh
 
-
-#   if debug : msg('Finished calculating jaccard similarities.')
-#   dictindices=dict(zip(snames,range(len(snames))))
-#   dfj=pd.DataFrame(index=snames,columns=snames,data=jgrid)
-#   dfj.index.name='system1'
-#   dfj.columns.name='system2'
-#   
-#   dfjm=dfj.reset_index().melt(id_vars='system1',value_name='jaccard')
-#   dfjm=dfjm[[ dictindices.get(r.system1,1e6)< dictindices.get(r.system2,1e6) for x,r in dfjm.iterrows() ]]
-#   
-#   dfraws=pd.DataFrame([ dict(s1_minus_s2=len(smem[r.system1] - smem[r.system2]),
-#                          s2_minus_s1=len(smem[r.system2] - smem[r.system1]),
-#                          intersection=len(smem[r.system2] & smem[r.system1]),
-#                          union=len(smem[r.system2] | smem[r.system1])) for x,r in dfjm.iterrows() ],index=dfjm.index)
-
-#   dfjm=dfjm.join(dfraws)
-
-#   dfjm_noparents=dfjm.query('s1_minus_s2 > 0 and s2_minus_s1 > 0 and jaccard > 0')

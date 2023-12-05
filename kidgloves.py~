@@ -64,7 +64,7 @@ def read_cna_file(fn) :
     """ Load CNA file (TCGA via cbioportal) """
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
-        cnas=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean(numeric_only=True)
+        cnas=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean()
         cnas=cnas.reindex(cnas.index.dropna())
         cnas.index=cnas.index.astype(int).astype(str)
         cnas.columns.name='sample'
@@ -75,14 +75,14 @@ def read_rna_file(fn) :
     """ Load HiSeqV2 file and normalize (TCGA via cbioportal) """
     with warnings.catch_warnings() :
         warnings.simplefilter('ignore')
-        hiseq=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean(numeric_only=True)
+        hiseq=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean()
         hiseq=hiseq.reindex(hiseq.index.dropna())
         hiseq.index=hiseq.index.astype(int).astype(str)
         hiseq.index.name='Entrez_Gene_Id'
         hiseq.columns.name='sample'
         #hiseq=hiseq.drop(columns=['Hugo_Symbol'])
         from sklearn.preprocessing import StandardScaler
-        hiseq=hiseq.reset_index().groupby('Entrez_Gene_Id').mean(numeric_only=True)
+        hiseq=hiseq.reset_index().groupby('Entrez_Gene_Id').mean()
         hsss=pd.DataFrame(data=StandardScaler().fit_transform(hiseq.transpose()),index=hiseq.columns,columns=hiseq.index)
         return hsss
 
@@ -559,14 +559,12 @@ def _get_geneinfo() :
     generate event pairs for logit field analysis, excluding those where 
     a single gene is associated with both events.
     """
-    global _gi 
-    global _s2e
-    global _e2s
+    global _gi=pd.read_csv(geneinfopath,sep='\t')
+    global _s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(int).astype(str).values))
+    global _e2s=dict(zip(_gi.GeneID.astype(int).astype(str).values,_gi.Symbol.values))
 
-    _gi=pd.read_csv(geneinfopath,sep='\t')
-    _s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(int).astype(str).values))
-    _e2s=dict(zip(_gi.GeneID.astype(int).astype(str).values,_gi.Symbol.values))#BOLO: can this be dropped?
 
+#BOLO: can this be dropped?
 def annotate_map_locations(raw_model_stats_df) :
     """
     add chromosomal map locations from the ncbi's homo_sapiens.gene_info file

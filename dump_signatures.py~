@@ -77,7 +77,7 @@ msigframe=np.log10(
 df_arm=pd.read_csv(opj(cbioportal_path,'data_armlevel_cna.txt'),sep='\t').set_index('NAME').drop(columns=['ENTITY_STABLE_ID','DESCRIPTION']).transpose()
 df_arm.index.name='Tumor_Sample_Barcode'
 df_arm.index=[ '-'.join(x.split('-')[:3]) for x in df_arm.index ]
-df_arm=df_arm[ ~df_arm.isnull().all(axis=1) ].fillna('Gain')
+df_arm=df_arm[ ~df_arm.isnull().all(axis=1) ].fillna('Gain').replace({ 'Unchanged' : 0, 'Loss' : -1  , 'Gain' : 1}).astype(int)
 nndfa=pd.get_dummies(df_arm)
 # used to axe last 3 characters
 

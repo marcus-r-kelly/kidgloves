@@ -121,8 +121,7 @@ class LARGeSSE_G(object) :
             hierarchy_max_members=2000,
             hierarchy_name=None,
             hierarchy_features=None,
-            j_stringency=1e-2,
-            kongweight=None,
+            j_stringency=1e-2
             ) :
         super(LARGeSSE_G,self).__init__()
 
@@ -229,17 +228,6 @@ class LARGeSSE_G(object) :
         self.I=self.X.view()[:,:_i.shape[1]]
         self.H=self.X.view()[:,_i.shape[1]:(-1*_j.shape[1])]
 
-
-
-        if kongweight is None :
-            self.kongweight=0
-        else: 
-            self.kongweight=kongweight
-
-        kwv=self.get_kwv()
-
-        self.U = self.X*kwv
-
         self.features=np.array( list(self.genes)+
                                 list(self.hierarchy_features)+
                                 list(self.signatures.columns)+
@@ -278,31 +266,8 @@ class LARGeSSE_G(object) :
             subcc=getJ(thisomics,thissig)
             return thisy,np.concatenate([self.I,self.J,subcc],axis=1)[:,fslice]
         else : 
-            return thisy,self.U.view()[:,fslice]
+            return thisy,self.X.view()[:,fslice]
 
-    def get_kwv(self) : 
-        # the kong weight is the log10-relative weight of hierarchy values
-        # over signature values, excluding the final three columns which
-        # are not tumor properties but gene properties
-        ngenesys=len(self.genes)+len(self.hierarchy_features)
-        nsig=len(self.signatures.columns)
-
-        lkw=np.exp(np.log(10)*self.kongweight)
-
-        weightscale=((lkw*np.ones((ngenesys,))).sum()+
-                    (lkw*np.ones((nsig,))).sum())/(ngenesys+nsig)
-
-        genesysvalues=lkw/weightscale
-        sigvalues=1/weightscale
-
-        kwv=np.r_[np.ones((ngenesys,))*genesysvalues,
-                  np.ones((nsig,))*sigvalues,
-                  np.ones((3,))]
-        return kwv
-
-    def update_kongweight(self,kongweight) : 
-        self.kongweight=kongweight
-        self.U=self.X*self.get_kwv()
 
     def _gft(self,s) : 
         if s in self.genes : 
@@ -313,14 +278,14 @@ class LARGeSSE_G(object) :
 
     def copy(self) : 
         return LARGeSSE_G(
-                            hierarchy=self.H, # filename, dict, array, tensor
-                            omics=self.omics, # dataframe
-                            signatures=self.signatures, # dataframe
-                            samplefactor=self.samplefactor,
-                            hierarchy_max_members=self.hierarchy_max_members,
-                            hierarchy_name=self.hierarchy_name,
-                            hierarchy_features=self.hierarchy_features,
-                            j_stringency=self.j_stringency
+                        hierarchy=self.H, # filename, dict, array, tensor
+                        omics=self.omics, # dataframe
+                        signatures=self.signatures, # dataframe
+                        samplefactor=self.samplefactor,
+                        hierarchy_max_members=self.hierarchy_max_members,
+                        hierarchy_name=self.hierarchy_name,
+                        hierarchy_features=self.hierarchy_features,
+                        j_stringency=self.j_stringency
                         ) ;
 
 
@@ -341,10 +306,10 @@ def burn_in(lg,folds=5,n_repeats=15,log=True,alpharange=_default_alpharange) :
     kf=RepeatedKFold(n_splits=folds,random_state=int('0xc0ffee',16),n_repeats=n_repeats)
     with warnings.catch_warnings() : 
         warnings.simplefilter('ignore')  
-        for i,(tr,te) in enumerate(kf.split(lg.U)) : 
+        for i,(tr,te) in enumerate(kf.split(lg.X)) : 
             if log : lmsg(lg,i,lrtime,starttime)
             lrtime=time.time()
-            mse,thisalphas,thiscoefs=_do_burnin_burning(lg.U,lg.y,tr,te)
+            mse,thisalphas,thiscoefs=_do_burnin_burning(lg.X,lg.y,tr,te)
             if mse is not None : 
               mses.append(mse)
               alphas.append(thisalphas)
@@ -723,7 +688,7 @@ if __name__ == '__main__' :
     #~~~~~~~~Main analysis~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     msg("Performing main run...",end='')
     coremodel=LassoLars(alpha=alpha_empir,positive=True,fit_intercept=False)
-    coremodel.fit(lg.U[:,ofinterest_i],lg.y)
+    coremodel.fit(lg.X[:,ofinterest_i],lg.y)
     #ofinterest_i2=ofinterest_i[coremodel.coef_ > 0]
 
     mr=mainrun(lg,alpha_empir,ofinterest_i,n_runs=n_repeats)
