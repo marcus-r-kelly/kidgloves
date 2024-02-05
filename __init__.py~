@@ -1,8 +1,0 @@
-__all__=[
-        'kidgloves'
-        'largesse_g',
-        'hier',
-        ]
-
-from kidgloves import *
-
