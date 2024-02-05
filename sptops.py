@@ -6,11 +6,14 @@ def np_to_sparse_tensor(ndarray) :
     """
     Converts np array directly to sparse tensor (returned)
     """
-    idxs=np.where(ndarray);
+    idxs=ndarray.nonzero();
     vals=ndarray[idxs] ;
     idxs=np.stack(idxs,axis=0)
     #print(idxs.shape)
     return torch.sparse_coo_tensor(indices=idxs,values=vals,size=ndarray.shape).coalesce()
+
+def identity(shape) : 
+    return torch.sparse_coo_tensor(indices=np.c_[np.arange(shape),np.arange(shape)].transpose(),values=np.ones((shape,)),size=(shape,shape))
 
 
 def flatten_majorly(thetensor) :

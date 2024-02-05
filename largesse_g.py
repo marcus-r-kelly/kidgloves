@@ -1,40 +1,4 @@
-if __name__ == '__main__' : 
-    import argparse
-    parser=argparse.ArgumentParser()
-    parser.add_argument('--rules',
-        action='store',
-        help='Folder with cohort rules, including signature tables, logit data tables, and logit transformers.')
-    parser.add_argument('--hierarchy',
-        action='store',
-        help='pickled hierarchy, storing a dict where keys are strings identifing systems and values are sets of entrez IDs as strings')
-    parser.add_argument('--outpath',
-        action='store',
-        default='output',
-        help='folder in which to dump run results. Will be created at execution if necessary.')
-    parser.add_argument('--n_repeats',
-        action='store',
-        default=500,
-        help='Number of cohort bootstraps to conduct')
-    parser.add_argument('--burn_in_repeats',
-        action='store',
-        default=20,
-        help='Number of repeats for coefficient exploration during burn-in.')
-    parser.add_argument('--sample_factor',
-        action='store',
-        default=0.5,
-        help='Size of the training set during cross-validated fitting.')
-    parser.add_argument('--post_hoc_power',
-        action='store',
-        default=50,
-        help='Factor by which to resample coefficients to estimate significance, as a multiple of the number of coefficients.')
-    parser.add_argument('--j_stringency',
-        action='store',
-        default=2,
-        help='Negative power of ten by which to select nonzero elements of J. i.e. if j_stringency=2, p=0.01')
-
-    ns=parser.parse_args()
-
-
+import json
 import os
 import sys
 import time
@@ -50,6 +14,8 @@ def lmsg(lg,x,lrtime,starttime) :
 
 import pandas as pd
 import numpy as np
+import numpy.typing as npt
+import typing
 import warnings
 import kidgloves as kg
 opj=kg.opj
@@ -58,39 +24,63 @@ kg.read_config()
 from sklearn.preprocessing import MaxAbsScaler
 from sklearn.linear_model import lars_path,Lasso,LassoLars
 from sklearn.model_selection import RepeatedKFold
-from collections import namedtuple
 import multiprocessing as mp
 import time
+elapsed=lambda t : time.time()-t
 from tqdm.auto import tqdm
+from itertools import product
 from functools import reduce
 from statsmodels.stats.multitest import multipletests
 from scipy.stats import bootstrap
 from scipy.stats.distributions import t
 import torch
+import torch.sparse
+import sptops
+from scipy.stats import binom
+from scipy.special import expit
+from dataclasses import dataclass
+from sklearn.model_selection import KFold
+CPU=torch.device('cpu')
+if torch.cuda.is_available() : 
+    DEVICE=torch.device('cuda:0')
+    print("Detected GPU.")
+else : 
+    DEVICE=CPU
+
+def msg(*args,**kwargs) : 
+    print(time.strftime("%m%d %H:%M:%S",time.localtime())+'|',*args,**kwargs)
+    sys.stdout.flush()
+
 #~~~~~~~~LARGeSSE-G core functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def getJ(omics,jmat,correlation_p=1e-2) : 
-    with warnings.catch_warnings() :
-        warnings.simplefilter('ignore')
-        thisprecorr=np.concatenate([omics,jmat],axis=1)
-        cc=np.corrcoef(thisprecorr.transpose())
-        subcc=cc[:omics.shape[1],(-1*jmat.shape[1]):]
-        subcc[ (subcc < 0) | np.isnan(subcc) ]=0.0
-
-        # this addition added 11/12/2023, following
-        # https://courses.lumenlearning.com/introstats1/chapter/testing-the-significance-of-the-correlation-coefficient/
-        n=omics.shape[0]
-        tstats=subcc*np.sqrt(n-2)/np.sqrt(1-subcc*subcc)
-        mydt=t(df=n-2)
-        cdfs=mydt.cdf(tstats)
-        sigmask=cdfs>(1-correlation_p)
-        subcc[ ~sigmask ]=0
-
-        return subcc
-
-def qunpickle(path) : 
-    with open(path,'rb') as f : 
-        return pickle.load(f)
+def spoof(hier,preserve_rowsums=True) : 
+    systemsizes=[ len(v) for k,v in hier.items() ]
+    memberships=[ vi for k,v in hier.items() for vi in v ]
+    if preserve_rowsums : 
+        mq=list(np.random.choice(memberships,size=len(memberships),replace=False))
+    else: 
+        mq=list(np.random.choice(list(set(memberships)),size=sum(systemsizes)*2,replace=True))
+    
+    outhier=dict()
+    sysind=0
+    
+    while len(mq) > 0 and len(systemsizes) > 0 : 
+        
+        syssize=systemsizes.pop()
+        newsyscontents=set()
+        for i in range(syssize) : 
+            if len(mq) < 1 : break
+            newsyscontents.add(mq.pop())
+                
+        outhier.update({'sys{:0>5}'.format(sysind) : newsyscontents })
+        sysind += 1
+        
+    return outhier
+            
+    
+@np.vectorize
+def _v_fix_tcga(barcode) :     
+    return '-'.join(barcode.split('-')[:3])
 
 def _fix_overlong_identifiers(df,index=True) :
     if index: 
@@ -102,522 +92,15 @@ def _fix_overlong_identifiers(df,index=True) :
 
     return df
 
-def lt_to_lg(hierarchyfilename,ltpicklefilename,**kwargs) : 
-
-    hierarchy=kg.qunpickle(hierarchyfilename) 
-    lt=kg.qunpickle(ltpicklefilename)
-    hname=hierarchyfilename.split(os.sep)[-1].split('.')[0]
-    return LARGeSSE_G(hierarchy,lt.training_data,lt.patients,hierarchy_name=hname,**kwargs)
-
-class LARGeSSE_G(object) : 
-    
-    def __init__(self,
-            hierarchy, # filename, dict, array, tensor
-            omics, # dataframe
-            signatures, # dataframe
-            loglengths, # Series - by EID
-            timing_coordinates, #Series - by EID
-            samplefactor=0.95,
-            hierarchy_max_members=2000,
-            hierarchy_name=None,
-            hierarchy_features=None,
-            j_stringency=1e-2,
-            kongweight=None,
-            ) :
-        super(LARGeSSE_G,self).__init__()
-
-        self.hierarchy_max_members  =   hierarchy_max_members 
-        self.hierarchy_name         =   hierarchy_name if hierarchy_name is not None else 'plumbus'
-        self.omics                  =   _fix_overlong_identifiers(omics)
-        self.signatures             =   _fix_overlong_identifiers(signatures)
-        self.samplefactor           =   samplefactor
-        self.j_stringency           =   j_stringency
-        assert type(self.omics) == pd.DataFrame
-        assert self.omics.columns.dtype == object
-        assert type(self.signatures) == pd.DataFrame
-        assert self.signatures.columns.dtype == object
-
-
-        _old_omics_index_length=self.omics.shape[0]
-        _old_signatures_index_length=self.signatures.shape[1]
-        common_patients=np.intersect1d(self.omics.index,self.signatures.index)
-        self.omics=self.omics.reindex(common_patients)
-        self.signatures=self.signatures.reindex(common_patients)
-        if len(common_patients) < _old_signatures_index_length  or len(common_patients) < _old_omics_index_length  :
-            warnings.warn(f"input patients {_old_omics_index_length},{_old_signatures_index_length} -> common patients {len(common_patients)}")
-
-        self.sigscale=MaxAbsScaler().fit_transform(self.signatures) 
-        # this should tbh be unnecessary when loaded from a pickled logittransformer
-        _jbase=getJ(self.omics,self.sigscale,correlation_p=self.j_stringency).astype(np.float32)
-
-        lld=dict(zip(loglengths.index,loglengths.values))
-        llmean=loglengths.mean()
-        lls=pd.Series(
-                        data=MaxAbsScaler().fit_transform(
-                            np.array([ lld.get(e.split('_')[0],llmean) for e in self.omics.columns ]).reshape(-1,1)).ravel() ,
-                        index=self.omics.columns,
-                        )
-            
-        rcd=dict(zip(timing_coordinates.index,timing_coordinates.values))
-
-        timing_coordinates= pd.Series(
-                                    data=MaxAbsScaler().fit_transform(np.array([ rcd.get(e.split('_')[0],llmean) for e in self.omics.columns ]).reshape(-1,1)).ravel(),
-                                    index=self.omics.columns,
-                            )
-
-        intercept=-1*np.ones((omics.shape[1],))
-
-        _j=np.c_[_jbase,lls,timing_coordinates,intercept]
-        
-        self.y=np.log10(omics.sum(axis=0)+1)
-
-        self.getfeaturetype=np.vectorize(self._gft)
-
-        if type(hierarchy) in (dict,str): 
-            # "I have been given a file path containing a pickled dictionary"
-            # "I have been given a dictionary
-            if type(hierarchy) == str : 
-                _hdict=kg.qunpickle(hierarchy)
-                if not self.hierarchy_name : 
-                    self.hierarchy_name=hierarchy.split(os.sep)[-1].split('.')[0]
-
-            else : 
-                _hdict=hierarchy
-
-            if len(_hdict) > 0 : 
-                _nmo=kg.mask_nest_systems_from_omics(_hdict,omics)
-                _h=kg.arrayify_nest_mask(_nmo,omics.columns).numpy() 
-            else : 
-                _h=np.zeros((omics.columns.shape[0],0))
-            self.hierarchy_features=sorted(list(_hdict.keys()))
-            if hierarchy_features is not None : 
-                warnings.warn('Since features are provided as dictionary keys, hierarchy names passed via __init__() are ignored')
-
-
-        elif type(hierarchy) in (np.ndarray,torch.Tensor)  : 
-            # "I have been given a hierarchy membership array"
-            # "I have been given a hierarchy membership tensor"
-            if type(hierarchy) == np.ndarray : 
-                _h=hierarchy
-            else:
-                _h=hierarchy.detach().cpu().numpy()
-
-            try : 
-                assert hierarchy_features is not None
-            except AssertionError as e : 
-                raise e('if hierarchies are passed as numeric/logical types then keys must also be provided')
-            self.hierarchy_features=hierarchy_features
-        else : 
-            raise ValueError(f"Unknown hierarchy data type {type(hierarchy)}")
-
-
-        _hsum=_h.sum(axis=0)
-        hcols_inbounds=np.argwhere((_hsum>1) & (_hsum<self.hierarchy_max_members)).ravel()
-        _h=_h[:,hcols_inbounds].astype(np.float32)
-        self.hierarchy_features=np.array(self.hierarchy_features)[hcols_inbounds]
-
-        self.genes=np.array(sorted(list({ c.split('_')[0] for c in omics.columns })))
-        _i=np.array([ ( c.split('_')[0] == self.genes ) for c in omics.columns]).astype(np.float32)
-
-
-        self.random_seed=None
-        self.set_random_seed('0xc0ffee')
-        self.oindices=np.arange(self.omics.shape[0],dtype=np.uint32)
-
-        self.X=np.concatenate([ _i,_h,_j ],axis=1)
-        self.J=self.X.view()[:,(-1*_j.shape[1]):]
-        self.I=self.X.view()[:,:_i.shape[1]]
-        self.H=self.X.view()[:,_i.shape[1]:(-1*_j.shape[1])]
-
-
-
-        if kongweight is None :
-            self.kongweight=0
-        else: 
-            self.kongweight=kongweight
-
-        kwv=self.get_kwv()
-
-        self.U = self.X*kwv
-
-        self.features=np.array( list(self.genes)+
-                                list(self.hierarchy_features)+
-                                list(self.signatures.columns)+
-                                ['log_length','timing_coordinate','intercept']
-                                )
-
-    def set_random_seed(self,seed) :
-        if type(seed) == str : 
-            self.random_gen=np.random.RandomState(np.random.MT19937(int(seed,16)))
-        else : # better be int
-            self.random_gen=np.random.RandomState(np.random.MT19937(seed))
-
-    def shuf_oindices(self) : 
-        k=int(self.samplefactor*self.omics.shape[0])
-        return self.random_gen.choice(self.oindices,size=k)
-
-    def resample(self,indices=None,recalc_J=False,feature_indices=None) : 
-        if indices is None:
-            indices=self.shuf_oindices()
-
-        if feature_indices is None :
-            fslice=slice(None,None)
-        else : 
-            fslice=feature_indices
-
-        thisomics=   self.omics.values.view()[indices]
-        #thisomics=   self.omics.values[indices].astype(np.float32)
-
-        defactosamplefactor=len(indices)/self.omics.shape[0]
-        
-        thisy   =   np.log10(1/defactosamplefactor*thisomics.sum(axis=0)+1)
-
-        if recalc_J : 
-            thissig =   self.signatures.values.view()[indices,:]
-            #thissig =   self.signatures.values[indices,:].astype(np.float32)
-            subcc=getJ(thisomics,thissig)
-            return thisy,np.concatenate([self.I,self.J,subcc],axis=1)[:,fslice]
-        else : 
-            return thisy,self.U.view()[:,fslice]
-
-    def get_kwv(self) : 
-        # the kong weight is the log10-relative weight of hierarchy values
-        # over signature values, excluding the final three columns which
-        # are not tumor properties but gene properties
-        ngenesys=len(self.genes)+len(self.hierarchy_features)
-        nsig=len(self.signatures.columns)
-
-        lkw=np.exp(np.log(10)*self.kongweight)
-
-        weightscale=((lkw*np.ones((ngenesys,))).sum()+
-                    (lkw*np.ones((nsig,))).sum())/(ngenesys+nsig)
-
-        genesysvalues=lkw/weightscale
-        sigvalues=1/weightscale
-
-        kwv=np.r_[np.ones((ngenesys,))*genesysvalues,
-                  np.ones((nsig,))*sigvalues,
-                  np.ones((3,))]
-        return kwv
-
-    def update_kongweight(self,kongweight) : 
-        self.kongweight=kongweight
-        self.U=self.X*self.get_kwv()
-
-    def _gft(self,s) : 
-        if s in self.genes : 
-            return 'gene'
-        if s in self.hierarchy_features : 
-            return 'system'
-        return 'signature'
-
-    def copy(self) : 
-        return LARGeSSE_G(
-                            hierarchy=self.H, # filename, dict, array, tensor
-                            omics=self.omics, # dataframe
-                            signatures=self.signatures, # dataframe
-                            samplefactor=self.samplefactor,
-                            hierarchy_max_members=self.hierarchy_max_members,
-                            hierarchy_name=self.hierarchy_name,
-                            hierarchy_features=self.hierarchy_features,
-                            j_stringency=self.j_stringency
-                        ) ;
-
-
-_default_alpharange=10**np.linspace(-5,0,40)
-
-
-BurnInResult=namedtuple('BurnInResult',['coefs','dataframe'])
-
-def burn_in(lg,folds=5,n_repeats=15,log=True,alpharange=_default_alpharange) : 
-
-    if log : msg("Doing burn-in analyses to scout for alpha and meaningful features...",end='\n')
-    starttime=time.time()
-    lrtime=starttime
-    mses=list()
-    coefs=list()
-    alphas=list()
-
-    kf=RepeatedKFold(n_splits=folds,random_state=int('0xc0ffee',16),n_repeats=n_repeats)
-    with warnings.catch_warnings() : 
-        warnings.simplefilter('ignore')  
-        for i,(tr,te) in enumerate(kf.split(lg.U)) : 
-            if log : lmsg(lg,i,lrtime,starttime)
-            lrtime=time.time()
-            mse,thisalphas,thiscoefs=_do_burnin_burning(lg.U,lg.y,tr,te)
-            if mse is not None : 
-              mses.append(mse)
-              alphas.append(thisalphas)
-              coefs.append(thiscoefs)
-
-        return _do_burnin_wrapup(mses,alphas,coefs)
-
-
-def _do_burnin_burning(X,y,tr,te) : 
-   thistrx=X.view()[tr,:]
-   thistex=X.view()[te,:]
-   thistry=y.values.view()[tr]
-   thistey=y.values.view()[te]
-   try : 
-       #thisalphas,_,thiscoefs=lars_path(thistrx,thistry,positive=True,method='lasso',alpha_min=0,copy_X=True)
-       thisalphas,_,thiscoefs=lars_path(thistrx,
-                                       thistry,
-                                       positive=True,
-                                       method='lasso',
-                                       alpha_min=0,
-                                       copy_X=True,
-                                       Gram=np.dot(thistrx.T,thistrx),
-                                       eps=10*np.finfo(np.float32).eps,
-                                       max_iter=1500
-                                       )
-   except ValueError as e : 
-       print("Encountered issue # 9603 [https://github.com/scikit-learn/scikit-learn/issues/9603] Restarting.")
-       print(e)
-       return (None,None,None)
-       
-   mse=np.square(np.matmul(thistex,thiscoefs)-thistey.reshape(-1,1)).sum(axis=0)/len(thistey)
-   del thistrx,thistry,thistey,thistex
-   return mse,thisalphas,thiscoefs
-
-def _do_burnin_wrapup(mses,alphas,coefs) :
-        burninca=np.concatenate(coefs,axis=1)
-        burninalphas=np.concatenate(alphas,axis=0)
-        burninmses=np.concatenate(mses,axis=0)
-        burninsplits=np.array([ str(x) for x,c in enumerate(alphas) for _ in c ])
-
-        burnindf=pd.DataFrame(index=np.arange(len(burninsplits))).assign(
-            alpha=burninalphas,
-            lalpha=np.log10(burninalphas),
-            mse=burninmses, # fixed 11/17/2023, was "rmse" but was not in fact root
-            split=burninsplits)
-
-        return BurnInResult(
-                burninca,
-                burnindf)
-
-import threadpoolctl
-
-def qpickle(obj,fname) : 
-    with open(fname,'wb') as f : 
-        pickle.dump(obj,f)
-
-def burninpost(burninresult) : 
-
-    walphamean=np.exp(
-                    (np.log(burninresult.dataframe.alpha)/burninresult.dataframe.mse).sum() /
-                    (1/burninresult.dataframe.mse).sum()
-                )
-
-    ofinterest_i=np.argwhere((burninresult.coefs > 0 ).any(axis=1)).ravel()
-    return walphamean,ofinterest_i
-
-def burnin_dissection(burninresult) : 
-
-    bird=burninresult.dataframe.copy()
-    subcycle=list()
-
-    # figure out where within its split each cycle occurred
-    subcycle=list()
-    last_split=-1
-    sc=0
-    for x in bird.split.values : 
-        if int(x) > last_split : 
-            last_split=int(x)
-            sc=0
-        else :
-            sc += 1
-        subcycle.append(sc)
-    bird['subcycle']=subcycle 
-    bird=bird.sort_values(['subcycle','split'])
-
-    ucoefs=set()
-    crundata=pd.DataFrame(columns=['cumulative_unique_nz_coefs','unique_nz_coefs_this_run','unique_nz_coefs_this_split','collated_cycle'])
-    lastsplit=-1
-    ucoefs_by_split=dict()
-
-    #for x,r in bird.iterrows(): 
-    for x,r in enumerate(bird.itertuples()) :
-        ucoefs_this_run=set(np.argwhere(burninresult.coefs[:,x] != 0).ravel())
-        ucoefs |= ucoefs_this_run
-        ucoefs_by_split.update({ x : ucoefs_by_split.get(x,set()) | ucoefs_this_run })
-        crundata.loc[x]=pd.Series({ 'cumulative_unique_nz_coefs'  : len(ucoefs),
-                          'unique_nz_coefs_this_run'   : len(ucoefs_this_run),
-                          'unique_nz_coefs_this_split'   : len(ucoefs_by_split[x]),
-                          'collated_cycle' : x,
-                        })
-
-    ofinterest_i=np.argwhere(burninresult.coefs != 0)
-
-    crundata=crundata.join(bird)
-
-    birnz=burninresult.coefs[(burninresult.coefs > 0).any(axis=1),:].T
-    rr,cc=np.where(birnz > 0)
-
-    ofinterest_i=np.argwhere((burninresult.coefs != 0).any(axis=1)).ravel()
-
-    earliest_discovery = dict() ; 
-    for i in np.arange(birnz.shape[1]) : 
-        mask=( cc == i ) 
-        earliest_discovery.update({ ofinterest_i[i]  : rr[ mask].min() })
-    
-    return crundata
-
-
-MainResult=namedtuple('MainResult',['coefs','mses'])
-
-def mainrun(lg,alpha,ofinterest_i,n_runs=500,fold_threadpool_limit=10) : 
-
-    outdata=list()
-    import gc
-
-    cca=np.zeros((n_runs,len(ofinterest_i)))
-    mses=np.zeros((n_runs,))
-
-    import time
-    starttime=time.time()
-    lastroundstart=starttime
-
-    import warnings
-    with threadpoolctl.threadpool_limits(limits=int(fold_threadpool_limit*len(os.sched_getaffinity(0)))) : 
-        with warnings.catch_warnings() : 
-            warnings.simplefilter('ignore')  
-            for x in range(n_runs) : 
-                rhi=lg.shuf_oindices()
-                allindices=np.arange(lg.omics.shape[0])
-                lhi=np.setdiff1d(allindices,rhi)
-
-                ytrain,xtrain=lg.resample(indices=rhi,feature_indices=ofinterest_i)
-                ytest,xtest=lg.resample(indices=lhi,feature_indices=ofinterest_i)
-
-                mod=LassoLars(alpha=alpha,fit_intercept=False,positive=True)
-                mod.fit(xtrain,ytrain)
-
-                mse=np.square(mod.predict(xtest)-ytest).sum()/len(ytest)
-
-                cca[x,:]=mod.coef_
-                mses[x]=mse
-
-    return MainResult(cca,mses)
-
-
-import multiprocessing as mp
-class bootThrall(mp.Process) : 
-    def __init__(self,seed,core,outQ,sourceData,weights,alpha,maxIters,ct=(1-5e-2),bootstraps_per_strapping=100) : 
-        super(bootThrall,self).__init__()
-        self.gen=np.random.RandomState(np.random.MT19937(seed))
-        self.outQ=outQ
-        self.sourceData=sourceData
-        self.maxIters=maxIters
-        self.core=core
-        self.weights=weights
-        self.alpha=alpha
-        self.bootstraps_per_strapping=bootstraps_per_strapping
-        
-    def run(self) :
-
-        ct=0.95
-
-        os.sched_setaffinity(os.getpid(),[self.core,])
-        register=pd.DataFrame(index=self.sourceData.columns,
-                               columns=['above','total'],
-                               data=np.zeros((len(self.sourceData.columns),2)))
-        
-        livecols=np.array(self.sourceData.columns)
-        bootstraps=0
-        
-        for x in range(self.maxIters) : 
-            bootbatch=pd.DataFrame(index=list(range(self.bootstraps_per_strapping)),
-                                   columns=livecols,
-                                   data=np.stack([ do_boot(self.sourceData,self.weights,self.gen,cols=livecols) for x in range(self.bootstraps_per_strapping) ],axis=0))
-
-            bootstraps += self.bootstraps_per_strapping
-            aboves=(bootbatch > self.alpha).sum(axis=0)
-            register['above']=register.above.add(aboves,fill_value=0)
-            register.loc[livecols,'total'] = bootstraps 
-
-            quantiles=register.loc[livecols,'above']/register.loc[livecols,'total']
-            livecols=quantiles[ quantiles > ct ].index
-            
-            if len(livecols) < 1 : break
-            
-        self.outQ.put(register)
-    
-def do_boot(dfcca,weights,gen,cols=None) :
-    if cols is None : 
-        cols=slice(None,None)
-        
-    sampled=gen.choice(np.arange(dfcca.shape[0]),size=int(dfcca.shape[0]),replace=True)
-    means=(weights[sampled,:]*dfcca.loc[sampled,cols]).sum(axis=0)/(weights[sampled,:]).sum()
-    return means
-
-def post_run_analysis(lg,ofinterest_i,mr,alpha,php=100) :
-
-    cca=mr.coefs
-    mses=mr.mses
-
-    ofinterest_c=lg.features[ofinterest_i]
-
-    ct=1-5e-2
-
-    weights=(1/mses).reshape(-1,1)
-    gen=np.random.RandomState(np.random.MT19937(int('0xdeadbeef',16)))
-    dfcca=pd.DataFrame(data=cca,columns=ofinterest_c,index=list(range(cca.shape[0])))
-
-    outQ=mp.Queue()
-    nthralls=len(os.sched_getaffinity(0))
-
-    power_sampling_requirement=php*lg.X.shape[1]//nthralls+1
-
-    thralls=[ bootThrall(gen.randint(1000),core,outQ,dfcca,weights,alpha,(power_sampling_requirement//nthralls)+1) for core in os.sched_getaffinity(0) ]
-    for t in thralls : t.start()
-    resslices=[ outQ.get() for x in range(nthralls) ]
-    register=reduce(pd.DataFrame.add,resslices)
-
-    complete_register=register.reindex(lg.features).fillna({'above' : 0 , 'total' : 1})
-    complete_register['p']=1-complete_register['above']/(complete_register['total'])
-    bxdf=pd.DataFrame(data=lg.X,columns=lg.features,index=lg.omics.columns)
-
-    complete_register['FDR']=multipletests(complete_register.p,method='fdr_bh')[1]
-    complete_register['empir_mean']=(dfcca*weights).sum(axis=0)/weights.sum()
-    complete_register['frac_nz']=(dfcca > 0).sum(axis=0)/dfcca.shape[0]
-    complete_register=complete_register.fillna({ 'empir_mean' : 0.0 , 'frac_nz' : 0.0})
-    complete_register['nlFDR']=[ -1*np.log10(max([1e-10,f])) for f in complete_register.FDR.values ]
-    complete_register['is_hit']=complete_register.FDR.lt(5e-2)
-    complete_register['feature_type']=lg.getfeaturetype(complete_register.index)
-    complete_register['n_members']=(bxdf > 0).sum(axis=0)
-
-    bsresult=bootstrap([cca,],np.mean,axis=0,confidence_level=(1-5e-2),n_resamples=int(1e3))
-
-    bslowdata=list()
-    bshidata=list()
-    bssedata=list()
-    for x,c in enumerate(ofinterest_c) : 
-        bslowdata.append(bsresult.confidence_interval.low[x])
-        bshidata.append(bsresult.confidence_interval.high[x])
-        bssedata.append(bsresult.standard_error[x])
-        
-    complete_register=complete_register.assign(
-        bslow=pd.Series(index=ofinterest_c,data=bslowdata),
-        bshi=pd.Series(index=ofinterest_c,data=bshidata),
-        bsse=pd.Series(index=ofinterest_c,data=bssedata),
-    ).fillna(0)
-
-    return complete_register
-
-
-def get_earliest_discovery(bir) :
-    birnz=bir.coefs[(bir.coefs > 0).any(axis=1),:].T
-    rr,cc=np.where(birnz > 0)
-
-    earliest_discovery = list() ; 
-    for i in np.arange(birnz.shape[1]) : 
-        mask=( cc == i ) 
-        earliest_discovery.append( rr[ mask].min() )
-
-    return np.array(earliest_discovery)
-
-acconly=np.vectorize(lambda x : x.split('.')[0])
-eidonly=np.vectorize(lambda x : x.split('_')[0])
+def prep_guts(tcga_directory,mutation_signature_path) :
+    #TODO-- find out why you have lost 6 patients
+    omics=kg.autoload_events(tcga_directory,heuristic=False,n2keep=0,mutations_from=opj(os.path.split(mutation_signature_path)[0],'mutations.maf'))
+    msig=pd.read_csv(mutation_signature_path,index_col=0)
+    tms=torch.tensor(msig.values)
+    omics=_fix_overlong_identifiers(omics)
+    omics=omics.reindex(msig.index)
+
+    return omics,msig
 
 def load_protein_datas() : 
     #TODO : customize script to accommodate different timings
@@ -630,7 +113,7 @@ def load_protein_datas() :
 
     grh=pd.read_csv('/cellar/users/mrkelly/Data/canon/ncbi_reference/gene2refseq_human.tsv',
             names=['taxid','GeneID','status','msg_acc','msg_gi','protein_acc','protein_gi','genomic','genoimc_gi','gstart','gend','strand','assembly','matpep_acc','matpep_gi','Symbol'],
-            sep='\t')
+            sep='\t',low_memory=False)
     pi=pd.read_csv('/cellar/users/mrkelly/Data/canon/ncbi_reference/genpept/pept_info',sep='\t',index_col=0)
     pi=pi.assign(acc=acconly(pi['id'].values))
     grh=grh.assign(GeneID=grh.GeneID.astype(str),acc=acconly(grh.protein_acc))
@@ -644,101 +127,1363 @@ def load_protein_datas() :
     wbins=cc*bins
     waverage=np.sum(wbins,axis=1)/np.sum(bins,axis=1)
     rt['coord']=waverage
+    rto= rt.set_index('GeneID').coord
+    rto=rto.sort_values(ascending=False)
+    rto=rto[ ~rto.index.duplicated(keep='first') & ~rto.index.isnull() ].dropna()
 
-    return np.log10(fgb),rt.set_index('GeneID').coord
+    return np.log10(fgb),rto
 
+
+from scipy.stats.distributions import t
+def regularize_cc(ccmat,n,correlation_p=1e-3) : 
+    tstats=ccmat*np.sqrt(n-2)/np.sqrt(1-ccmat*ccmat)
+    tthresh=t.isf(correlation_p,df=n-2)
+    sigmask=tstats > tthresh
+    out=ccmat.copy()
+    out[ ~sigmask ]=0
+    
+    return out
+
+from scipy.stats.distributions import t
+def regularize_cc_torch(ccten,n,correlation_p=1e-3) : 
+    tstats=ccten*torch.sqrt(torch.tensor(n,device=ccten.device)-2)/torch.sqrt(1-ccten*ccten)
+    tthresh=t.isf(correlation_p,df=n-2)
+    sigmask=tstats > tthresh
+    out=ccten.clone()
+    out[ ~sigmask ]=0
+    
+    return out
+
+def cc2mats(m1,m2) :
+    """
+    This function finds the correlation coefficient between all **columns** of two matrices m1 and m2.
+    (The rows are the observations measured across all variables in both columns).
+    This does _not_ show the correlation coefficient between any two variables that are both columns of the 
+    same matrix.
+    """
+
+    m1bar=m1.mean(axis=0)
+    m2bar=m2.mean(axis=0)
+    m1sig=m1.std(axis=0)
+    m2sig=m2.std(axis=0)
+    n=m1.shape[0]
+
+    cov=np.dot(
+            (m1-m1bar).transpose(),
+            (m2-m2bar)
+            )
+    with warnings.catch_warnings() : 
+        warnings.simplefilter('ignore')  
+        cov1=cov/m2sig
+        cov1[ np.isnan(cov1) ]=0
+        cov2=cov1.transpose()/m1sig
+        cov2[ np.isnan(cov2) ]=0
+        out=cov2.transpose()/n
+
+    return out
+
+def cc2tens(t1,t2) : 
+    """
+    This function finds the correlation coefficient between all **columns** of two dense tensors t1 and t2.
+    (The rows are the observations measured across all variables in both columns).
+    This does _not_ show the correlation coefficient between any two variables that are both columns of the 
+    same matrix.
+    """
+    if t1.is_sparse: 
+        t1=t1.clone().to_dense()
+    if t2.is_sparse: 
+        t2=t2.clone().to_dense()
+
+
+    t1bar=t1.mean(axis=0)
+    t2bar=t2.mean(axis=0)
+    t1sig=t1.std(axis=0)
+    t2sig=t2.std(axis=0)
+    n=t1.shape[0]
+
+    cov=torch.matmul(
+            (t1-t1bar).transpose(0,1),
+            (t2-t2bar)
+            )
+    cov1=cov/t2sig
+    cov1[ torch.isnan(cov1) ]=0
+    cov2=cov1.transpose(0,1)/t1sig
+    cov2[ torch.isnan(cov2) ]=0
+    out=cov2.transpose(0,1)/n
+    return out
+
+
+
+event2eid=lambda c: c.split('_')[0]
+
+class LARGeSSE_G(object) : 
+
+    def __init__(self,**kwargs) : 
+        super(LARGeSSE_G,self).__init__()
+        self.device=kwargs.get('device',DEVICE)
+
+        self.gen=np.random.RandomState(np.random.MT19937(seed=int('0xc0ffee',16))) 
+
+        omics=kwargs.get('omics')
+        signatures=kwargs.get('signatures')
+        if omics is not None : 
+            self._assign_omics(omics)
+
+        if signatures is not None: 
+            self._assign_signatures(signatures)
+
+        if hasattr(self,'omics') and hasattr(self,'signatures') : 
+            self._sync_feeder_indices()
+
+        self.correlation_p=kwargs.get('correlation_p',1e-3)
+
+        lengths=kwargs.get('lengths')
+        if lengths is not None : 
+            self._assign_lengths(lengths)
+
+        timings=kwargs.get('timings')
+        if timings is not None : 
+            self._assign_timings(timings)
+
+        hierarchy=kwargs.get('hierarchy')
+
+        if hierarchy is not None : 
+            self._assign_hierarchy(hierarchy)
+
+    def _assign_lengths(self,lengths) : 
+        assert hasattr(self,'omics')
+        self.lengths=lengths.copy()
+        self.lengths.index=np.vectorize(lambda s : s+'_mut')(self.lengths.index)
+        self.lengths=self.lengths.reindex(self.full_index).fillna(0)
+        self.t_lengths=torch.tensor(self.lengths.values,dtype=DTYPE,device=self.device)
+
+    def _assign_timings(self,timings) : 
+        assert hasattr(self,'omics')
+        self.timings=timings.copy()
+        self.timings.index=np.vectorize(lambda s : s+'_mut')(self.timings.index)
+        self.timings=self.timings.reindex(self.full_index).fillna(0)
+        self.t_timings=torch.tensor(self.timings.values,dtype=DTYPE,device=self.device)
+
+    def _assign_hierarchy(self,hierarchy,system_limit_upper=2000,system_limit_lower=4) : 
+        assert hasattr(self,'omics')
+        assert hasattr(self,'y')
+
+        self.hierarchy={ k : v for k,v in hierarchy.items()
+                            if len(v) < system_limit_upper and len(v) > system_limit_lower }
+        if len(self.hierarchy) < 1 : 
+            self.nmo=None
+            self.systems=None
+            return
+
+            
+        gd={ g : i for i,g in enumerate(self.genes) }
+        ssk=sorted(self.hierarchy.keys())
+        #sd={ s : j for j,s in enumerate(ssk) }
+
+        row_indices=list()
+        col_indices=list()
+        for j,sk in enumerate(ssk) : 
+            ri=[ gd[g] for g in self.hierarchy[sk] if g in gd]
+            row_indices.extend(ri)
+            col_indices.extend([j]*len(ri))
+            
+        sphier=torch.sparse_coo_tensor(
+            indices=np.c_[col_indices,row_indices].transpose(),
+            values=np.ones((len(row_indices,))),
+            size=(len(ssk),len(self.genes)),
+            device=self.device
+        ).coalesce().transpose(0,1).float()
+
+        self.nmo=torch.sparse.mm(self.ii,sphier)
+
+        self.systems=ssk
+
+    def _assign_omics(self,omics,resolve_cn_conflicts=True) : 
+        """
+        omics should be a pd.DataFrame as generated by kidgloves.autoload_events
+        """
+
+
+        self.genes=np.unique(np.vectorize(event2eid)(omics.columns)) 
+        self.full_index=np.array([ '_'.join([eid,suf]) for suf,eid in product(['mut','fus','up','dn'],self.genes) ])
+        self.omics=_fix_overlong_identifiers(omics).reindex(columns=self.full_index).fillna(0).astype(np.float32)
+
+        ltypes=np.r_[*[[lt]*len(self.genes) for lt in ['mut','fus','up','dn']]]
+        #TODO: implement this and verify that it works in the increasingly misnamed "dropout" notebook
+        if resolve_cn_conflicts: 
+            ltypes=np.r_[*[[lt]*len(self.genes) for lt in ['mut','fus','up','dn']]]
+            uptotals=self.omics.values[:,( ltypes == 'up' )].sum(axis=0)+1
+            dntotals=self.omics.values[:,( ltypes == 'dn' )].sum(axis=0)+1
+            lquot=np.log(uptotals/dntotals)/np.log(2)
+            keepups=( lquot > -1 ) | (uptotals+dntotals < 5)
+            keepdns=(lquot < 1 ) | (uptotals+dntotals < 5)
+            omask=np.r_[[True]*2*len(self.genes),keepups,keepdns]
+
+            self.omics=self.omics[ self.omics.columns[omask]]
+
+        self.t_omics=torch.tensor(self.omics.values,
+                                    dtype=DTYPE,
+                                    device=self.device)
+
+        self._c_omics_mut=torch.tensor(self.omics.columns.str.endswith('_mut'),device=self.device)
+        self._c_omics_fus=torch.tensor(self.omics.columns.str.endswith('_fus'),device=self.device)
+        self._c_omics_up=torch.tensor(self.omics.columns.str.endswith('_up'),device=self.device)
+        self._c_omics_dn=torch.tensor(self.omics.columns.str.endswith('_dn'),device=self.device)
+        self._c_omics_struct= self._c_omics_fus | self._c_omics_up | self._c_omics_dn
+
+        self._r_genes=np.vectorize(event2eid)(omics.columns)
+        # at each row of **omics**, what gene is being represented?
+
+        self._t_row_indices=torch.arange(len(self._r_genes),device=self.device,dtype=torch.float)
+
+        self.build_y()
+
+        iivalues=np.ones((len(self._r_genes),))
+
+        # at each row, what is the column of each gene being referenced
+        cog=dict(zip(self.genes,list(range(len(self.genes)))))
+        # eid -> column
+        lam=np.vectorize(lambda x : cog[x])
+        iirow_indices=torch.tensor(np.arange(len(self._r_genes)),device=self.device)
+        # will be slot in on dimension 0 but then tranposed
+        iicol_indices=torch.tensor(lam(self._r_genes),device=self.device)
+
+
+        # the columns are genes
+        # the rows are events
+        self.ii=torch.sparse_coo_tensor(
+                        indices=torch.stack([iicol_indices,iirow_indices],axis=-1).transpose(0,1),
+                        values=iivalues,
+                        size=(len(self.genes),len(self._r_genes)),
+                        device=self.device #new
+                  ).coalesce().transpose(0,1).float().coalesce()
+
+
+
+    def _assign_signatures(self,signatures) : 
+        self._c_signature_sbs=torch.tensor(signatures.columns.str.startswith('SBS'),device=self.device)
+        self._c_signature_dbs=torch.tensor(signatures.columns.str.startswith('DBS'),device=self.device)
+        self._c_signature_id=torch.tensor(signatures.columns.str.startswith('ID'),device=self.device)
+        self._c_signature_cn=torch.tensor(signatures.columns.str.startswith('CN'),device=self.device)
+        self._c_signature_arm=torch.tensor(signatures.columns.str.startswith('arm_pc'),device=self.device)
+        self._c_signature_point=self._c_signature_sbs | self._c_signature_dbs | self._c_signature_id
+        self._c_signature_region=self._c_signature_cn | self._c_signature_arm
+        self.signatures=_fix_overlong_identifiers(signatures).astype(np.float32)
+
+        self.t_signatures=torch.tensor(self.signatures.values,device=self.device,dtype=DTYPE)
+
+        self.signature_names=np.array(self.signatures.columns)
+
+    def _sync_feeder_indices(self): 
+        pats=np.intersect1d(self.omics.index,self.signatures.index)
+        self.patients=pats
+        self._t_pat_indices=torch.arange(len(pats),device=self.device,dtype=torch.int)
+        self._assign_omics(self.omics.reindex(pats))
+        self._assign_signatures(self.signatures.reindex(pats))
+
+    def features(self,force=False) : 
+        assert hasattr(self,'omics')
+        assert hasattr(self,'nmo')
+        assert hasattr(self,'signatures')
+
+        systems=self.systems if self.systems is not None else list()
+
+        if (not hasattr(self,'_features') or (self._features is None)) or force : 
+            self._features=np.r_[self.genes,systems,self.signature_names,['max_prot_length','replication_timing']]
+            #self._features=np.r_[self.genes,self.systems,self.signature_names,['max_prot_length','replication_timing','intercept']]
+        return self._features
+
+    def featuretypes(self,force=False) : 
+        systems=self.systems if self.systems is not None else list()
+
+        if (not hasattr(self,'_featuretypes') or (self._featuretypes is None)) or force : 
+            self._featuretypes = np.r_[['gene']*len(self.genes),['system']*len(systems),['signature']*len(self.signature_names),['length','timing']]
+            #self._featuretypes = np.r_[['gene']*len(self.genes),['system']*len(self.systems),['signature']*len(self.signature_names),['length','timing','intercept']]
+        return self._featuretypes
+
+    def build_J(self,patient_mask=None,gene_mask=None,correlation_p=None,inplace=False) :
+
+        if correlation_p is None : 
+            correlation_p=self.correlation_p 
+
+        if not patient_mask is None : 
+            omics=self.t_omics[patient_mask,:]
+            signatures=self.t_signatures[patient_mask,:]
+        else : 
+            omics=self.t_omics
+            signatures=self.t_signatures
+
+        if gene_mask is None : 
+            gcols=self._t_row_indices
+            mutcols= self._c_omics_mut
+            structcols= self._c_omics_struct
+        else : 
+            gcols=self._t_row_indices[gene_mask]
+            mutcols=gene_mask | self._c_omics_mut
+            structcols=gene_mask | self._c_omics_struct
+
+        with warnings.catch_warnings() : 
+            warnings.simplefilter('ignore')
+
+
+            cc_mut_vs_point=regularize_cc_torch(
+                cc2tens( omics[:,mutcols],
+                    signatures[:,self._c_signature_point],
+                ),
+                n=omics.shape[0],
+                correlation_p=correlation_p
+                ).float()
+            
+            cc_str_vs_region=regularize_cc_torch(
+                cc2tens( omics[:,structcols],
+                    signatures[:,self._c_signature_region],
+                ),
+                n=omics.shape[0],
+                correlation_p=correlation_p
+                ).float()
+
+            ccmvpnz=cc_mut_vs_point.nonzero().transpose(0,1)
+            sp_mvp=torch.sparse_coo_tensor(
+                    indices=ccmvpnz,
+                    values=cc_mut_vs_point[*ccmvpnz].ravel(),
+                    size=cc_mut_vs_point.shape,
+                    device=self.device #new
+                    ).coalesce()
+
+            ccsvrnz=cc_str_vs_region.nonzero().transpose(0,1)
+            sp_svr=torch.sparse_coo_tensor(
+                    indices=ccsvrnz,
+                    values=cc_str_vs_region[*ccsvrnz].ravel(),
+                    size=cc_str_vs_region.shape,
+                    device=self.device #new
+                    ).coalesce()
+
+            sp_svr_adj_indices=sp_svr.indices()+torch.tensor(sp_mvp.shape,device=self.device).reshape(-1,1)
+
+            sp_J=torch.sparse_coo_tensor(
+                    indices=torch.cat([sp_mvp.indices(),sp_svr_adj_indices],axis=1),
+                    values=torch.cat([sp_mvp.values(),sp_svr.values()],axis=0),
+                    size=(len(gcols),self._c_signature_point.sum().item()+self._c_signature_region.sum().item()),
+                    device=self.device #new
+                    ).coalesce()
+
+        if inplace: 
+            self.J=sp_J
+
+        return sp_J
+
+    def build_y(self) : 
+        assert hasattr(self,'omics')
+        self.y=self.omics.sum(axis=0)
+        self.t_y=torch.tensor(self.y.values,device=self.device,dtype=DTYPE).reshape(-1,1)
+
+    def build_IH(self,weight=False,gene_mask=None,inplace=False,patient_mask=None) : 
+        assert hasattr(self,'omics')
+        assert hasattr(self,'hierarchy')
+        if not hasattr(self,'y'): 
+            self.build_y()
+
+
+        if gene_mask is not None : 
+            ii=mask_sparse_rows(self.ii,gene_mask).coalesce()
+            if self.nmo is not None :
+                nmo=mask_sparse_rows(self.nmo,gene_mask).coalesce()
+            else : 
+                nmo=self.nmo
+        else : 
+            ii=self.ii
+            nmo=self.nmo
+
+        if nmo is None : 
+            ih=ii.clone()
+        else : 
+            nmo_indices_adj=(torch.tensor([[0,ii.shape[1]]],device=self.device)+nmo.indices().transpose(0,1)).transpose(0,1)
+            ih=torch.sparse_coo_tensor(
+                values=torch.cat((ii.values(),nmo.values()),axis=0),
+                indices=torch.cat((ii.indices(),nmo_indices_adj),axis=1),
+                size=(ii.shape[0],ii.shape[1]+nmo.shape[1]),
+                device=self.device #new
+            )
+
+        if weight : 
+            psty=torch.tensor(t_y+1,device=self.device).ravel()
+            sppsty=psty.to_sparse_coo()
+            desppsty=sptops.diag_embed(sppsty)
+
+            ihw=torch.sparse.mm(desppsty.coalesce(),ih) # this multiplies across the values of y to each element
+
+            ihw_colsums=sptops.diag_embed(torch.pow(ihw.sum(axis=0),-1)) # this is the inverse of the column sums
+
+            ih=torch.sparse.mm(ihw,ihw_colsums) # this divides by the column sums
+
+        self.IH=ih
+
+        return ih
+
+    def build_X(self,inplace=False,normalize=True,**kwargs) : 
+
+        IH=kwargs.get('IH',self.IH).coalesce()
+        J=kwargs.get('J',self.J).coalesce()
+        timings=kwargs.get('timings',self.t_timings).clone().reshape(-1,1)
+        lengths=kwargs.get('lengths',self.t_lengths).clone().reshape(-1,1)
+
+        j_shift=IH.shape[1]
+        length_shift=j_shift+J.shape[1]
+        timing_shift=length_shift+1
+
+        tnz=timings.nonzero().transpose(0,1)
+        tv=torch.sparse_coo_tensor(
+            indices=tnz,
+            values=timings[tnz[0].ravel()].ravel(),
+            size=timings.shape,
+            device=self.device #new
+            ).coalesce()
+
+        lnz=lengths.nonzero().transpose(0,1)
+        lv=torch.sparse_coo_tensor(
+            indices=lnz,
+            values=lengths[lnz[0].ravel()].ravel(),
+            size=lengths.shape,
+            device=self.device #new
+            ).coalesce()
+
+        j_adj_indices=J.indices()+torch.tensor([[0],[j_shift]],device=self.device)
+        length_adj_indices=lv.indices()+torch.tensor([[0],[length_shift]],device=self.device)
+        timing_adj_indices=tv.indices()+torch.tensor([[0],[timing_shift]],device=self.device)
+        #intercept_indices=torch.tensor(np.c_[np.zeros((IH.shape[0],),dtype=float),(1+timing_shift)*np.ones((IH.shape[0],),dtype=float)].transpose())
+
+        X=torch.sparse_coo_tensor(
+                indices=torch.cat([IH.indices(),j_adj_indices,length_adj_indices,timing_adj_indices],axis=1),
+                values=torch.cat([IH.values(),J.values(),lv.values(),tv.values()],axis=0),
+                size=(IH.shape[0],IH.shape[1]+J.shape[1]+2),
+                device=self.device #new
+                ).float()
+
+        #X=torch.sparse_coo_tensor(
+                #indices=np.c_[IH.indices(),j_adj_indices,length_adj_indices,timing_adj_indices,intercept_indices],
+                #values=np.r_[IH.values(),J.values(),lv.values(),tv.values(),-1*np.ones((IH.shape[0],))],
+                #size=(IH.shape[0],IH.shape[1]+J.shape[1]+3)
+                #).float()
+
+        if normalize : 
+            xd=X.to_dense()
+            xdm=xd.max(axis=0).values
+            xdw=xd/xdm
+            xdw[ torch.isnan(xdw) ]=0
+            X=xdw.float()
+            #X[:,-1]=-1
+            X=X.to_sparse()
+            
+
+        if inplace: 
+            self.X=X
+        return X
+
+    def guess_weights(self) : 
+        guesses=torch.clip(cc2tens(self.X,self.t_y),0,torch.inf).ravel()
+        guess_intercept=torch.tensor(-5,device=DEVICE,dtype=torch.float)
+        return guesses,guess_intercept
+
+
+    def sample_patients(self,frac=None,n=1,replace=False) : 
+
+        assert hasattr(self,'patients')
+
+        if frac is not None : 
+            n=int(frac*len(self.patients)//1.0)
+
+        return torch.multinomial(input=torch.ones_like(self._t_pat_indices).float(),num_samples=n).int()
+
+    def sample_rows(self,frac=None,n=1,replace=False) : 
+
+        # right now this 
+
+        assert hasattr(self,'genes')
+        if frac is not None : 
+            n=int(frac*len(self._r_genes)//1.0)
+
+        return torch.multinomial(input=torch.ones_like(self._t_row_indices),num_samples=n).int()
+
+    def sample_genes(self,frac=None,n=1,replace=False) : 
+
+        assert hasattr(self,'genes')
+        if frac is not None : 
+            n=int(frac*len(self.genes)//1.0)
+
+        picked_genes=torch.tensor(
+                np.argwhere(
+                        np.isin(
+                            self._r_genes,
+                            self.gen.choice(self.genes,n,replace=False)
+                            )
+                        ).ravel(),
+                device=self.device,
+                dtype=torch.int
+            )
+        # these are indices
+        return picked_genes
+
+    def sample_xy(self,gene_frac=None,gene_n=None,patient_frac=None,patient_n=None,recalc_J=False,renormalize_X=False,reweight_IH=False) : 
+
+        if gene_frac is not None or gene_n is not None : 
+            genes=self.sample_genes(frac=gene_frac,n=gene_n)
+        else : 
+            genes=self._t_row_indices.int()
+
+        if patient_frac is not None or patient_n is not None : 
+            patients=self.sample_patients(frac=patient_frac,n=patient_n)
+        else : 
+            patients=self._t_pat_indices.int()
+
+        return self.build_xy_from_subset(genes,patients,recalc_J=recalc_J,renormalize_X=renormalize_X)
+
+
+    def build_xy_from_subset(self,gene_indices,patient_indices,recalc_J=False,renormalize_X=False,reweight_IH=False) : 
+
+        if gene_indices is None : 
+            gene_mask=None
+            timings=self.t_timings.clone()
+            lengths=self.t_lengths.clone()
+        else : 
+            gene_mask=torch.isin(self._t_row_indices,gene_indices)
+            timings=self.t_timings[ gene_indices ].clone()
+            lengths=self.t_lengths[ gene_indices ].clone()
+
+        patient_mask=torch.isin(self._t_pat_indices,patient_indices)
+        sih=self.build_IH(gene_mask=gene_mask,patient_mask=patient_mask,weight=reweight_IH,inplace=False)
+
+        if recalc_J : 
+            sj=self.build_J(gene_mask=gene_mask,patient_mask=patient_mask)
+        else : 
+            if gene_mask is not None : 
+                sj=mask_sparse_rows(self.J,gene_mask)
+            else : 
+                sj=self.J
+
+
+        sX=self.build_X(IH=sih,J=sj,timings=timings,lengths=lengths,normalize=renormalize_X,inplace=False)
+        if gene_indices is not None and patient_indices is not None : 
+            sy=self.t_omics[patient_indices,:][:,gene_indices].sum(axis=0)
+        elif patient_indices is not None : 
+            sy=self.t_omics[patient_indices,:].sum(axis=0)
+        elif gene_indices is not None : 
+            sy=self.t_omics[gene_indices,:].sum(axis=0)
+        else : 
+            sy=self.t_omics.sum(axis=0)
+
+        return (sX,sy)
+
+def mask_sparse_rows(t,mask) :
+    imi=torch.argwhere(mask).ravel()
+    new_indices=torch.cumsum(mask,0)-1
+    timask=torch.isin(t.indices()[0],imi)
+    stvals=t.values()[timask]
+    ti=t.indices()[:,timask]
+    stindices=torch.stack([new_indices[ti[0]],ti[1]],axis=-1).transpose(0,1)
+    st=torch.sparse_coo_tensor(
+        values=stvals,
+        indices=stindices,
+        size=(mask.sum(),t.shape[1]),
+        device=t.device,
+    )
+
+    return st
+
+def mask_sparse_columns(t,mask) : 
+    imi=torch.argwhere(mask).ravel()
+
+    new_indices=torch.cumsum(mask,0)-1
+    
+    timask=torch.isin(t.indices()[1],imi)
+
+    stvals=t.values()[timask]
+    
+    ti=t.indices()[:,timask]
+
+    stindices=torch.stack([ti[0],new_indices[ti[1]]],axis=-1).transpose(0,1)
+    
+    st=torch.sparse_coo_tensor(
+        values=stvals,
+        indices=stindices,
+        size=(t.shape[0],mask.sum()),
+        device=t.device,
+    )
+
+    return st
+
+def cast_tensor(t,device=DEVICE,**kwargs) : 
+    if torch.is_tensor(t) : 
+        return t
+    else :
+        return torch.tensor(t,device=device,**kwargs)
+
+def copy_tensor(t,device=DEVICE) : 
+    if torch.is_tensor(t) : 
+        return t.clone()
+    else :
+        return torch.tensor(t,device=device)
+
+
+
+class LARGeSSE_Logprob(torch.nn.Module) : 
+    def __init__(self, nfeats,init_vals=None,device=DEVICE,init_intercept=None):
+        super(LARGeSSE_Logprob, self).__init__()
+        
+        self.relu = torch.nn.ReLU()
+        
+        if init_vals is None : 
+            self.weights=torch.nn.Parameter(torch.empty(size=(nfeats,),requires_grad=True,device=device,dtype=DTYPE))
+            torch.nn.init.uniform_(self.weights,a=0,b=1)
+        else : 
+            self.weights = torch.nn.Parameter(init_vals.clone())
+            
+        if init_intercept is None : 
+            self.intercept=torch.nn.Parameter(torch.tensor(0,dtype=DTYPE,device=device))
+        else : 
+            self.intercept=torch.nn.Parameter(copy_tensor(init_intercept).float().to(device))
+            
+    def forward(self,X,return_weights=False) :
+        corrected_weight=self.relu(self.weights) ;
+        bigdot=torch.matmul(X,corrected_weight)+self.intercept
+        
+        if not return_weights : 
+            return bigdot
+        else : 
+            return bigdot,corrected_weight
+    
+class MultiPenaltyBinomialLoss(torch.nn.Module) : 
+    def __init__(self,strengths,masks,device=DEVICE) : 
+        # strengths is an iterable container of floats
+        # masks is an iterable container of boolean numpy arrays spanning the feature space
+        # the sum of coefficients masked by mask 0 is multiplied by strength 0, etc.
+        
+        super(MultiPenaltyBinomialLoss,self).__init__()
+        
+        self.strengths=[ cast_tensor(s,device=device,dtype=DTYPE,requires_grad=False)
+                        for s in strengths ]
+        self.masks=[ cast_tensor(m,device=device,dtype=torch.bool,requires_grad=False)
+                        for m in masks ]
+
+    def forward(self,output_log_odds,target_event_cts,weights,n) : 
+        
+        eps=torch.finfo(output_log_odds.dtype).eps
+        
+        output_probs=torch.clip(torch.special.expit(output_log_odds),eps,1-eps)
+        log_output_probs=torch.log(output_probs)
+        k=target_event_cts
+        comb=torch.lgamma(n+1)-torch.lgamma(k+1)-torch.lgamma(n-k+1)
+        indiv_ells=(log_output_probs*k + torch.log(1-output_probs)*(n-k))
+        llterm=(comb+(indiv_ells)).sum()
+        
+        penalty=sum([ s*(weights[m]).sum() for s,m in zip (self.strengths,self.masks) ])
+
+        return penalty-llterm
+
+_default_lgbfs_kwargs=dict(
+max_iter=20,
+history_size=10
+)
+
+DTYPE=torch.float
+
+
+@dataclass
+class OptimizerResult : 
+    """ Class for storing results from the `run_model` function"""
+    loss : float
+    weight : npt.NDArray[typing.Any]
+    intercept : npt.NDArray[typing.Any] 
+    strengths : list 
+    masks : tuple 
+    sampling_epochs : npt.NDArray[typing.Any]
+    max_epochs : int 
+    lr  : float
+    lbgfs_kwargs : dict
+    convergence_status : bool
+
+@dataclass
+class AICResult: 
+    criterion : float
+    k : int
+    ll : float
+    n : int
+
+@dataclass
+class Settings: 
+    """ Class for storing run preferences"""
+
+# expected to be different between them
+#~~~~~~~~Process config~~~~~~~~~~~~~~~~~
+    save_tmps :  bool
+    tmpprefix : str
+    jobprefix : str
+    output_directory : str
+
+#~~~~~~~~Initialization config~~~~~~~~~~
+    hierarchy_path : str
+    tcga_directory : str
+    custom_omics : str
+    mutation_signature_path : str
+    correlation_p : float
+    j_regstrength : float
+    hsystem_limit_lower : 3
+    hsystem_limit_upper : 2000
+
+#~~~~~~~~Burn-in config~~~~~~~~~~~~~~~~~
+    burn_max_iter : int =100
+    burn_init_regstrength : int =10
+    burn_max_epochs_per_run : int=2001
+    burn_n_sampling_epochs_per_run : int=201
+    burn_lr : float =5e-4
+    burn_n_noh_runs : int = 10
+    burn_grad_floor : float =0.1
+    burn_convergence_timeout : int = 15
+#~~~~~~~~Main run config~~~~~~~~~~~~~~~~
+    main_max_epochs : int = 4001
+    main_n_sampling_epochs : int = 401
+    main_lr : float = 1e-4
+
+#~~~~~~~~Bootstrap config~~~~~~~~~~~~~~~
+    n_boot_runs : int = 1000
+    boot_patient_resampling_fraction  : float = 0.9
+    boot_max_epochs : int = 2001 
+    boot_n_sampling_epochs : int = 401
+    boot_lr : float = 1e-2
+
+#~~~~~~~~Spoof config~~~~~~~~~~~~~~~
+    n_spoofs : int = 20
+    spoof_lr  : float = 1e-4
+    
+@dataclass
+class BurnInResult : 
+  frame : typing.Any
+  ofinterest : npt.NDArray[typing.Any]
+  strengths : typing.List[float]
+
+
+class Logger(object) : 
+    def __init__(self,
+                 model,
+                 losser,
+                 sampling_epochs,
+                 nfeats,
+                 check_convergence=False,
+                 sampling_epochs_to_check_convergence=10,
+                 sampling_epochs_with_worse_loss_for_convergence=8,
+                 device=DEVICE,
+            ) : 
+        
+        super(Logger,self).__init__()
+        self.model=model
+        self.losser=losser
+        self.sampling_epochs=sampling_epochs
+        self.n_sampling_epochs=len(sampling_epochs)
+        self.se=0
+        
+        self.wlog=torch.zeros(size=(self.n_sampling_epochs,nfeats),dtype=DTYPE,device=device)
+        self.llog=torch.zeros(size=(self.n_sampling_epochs,),dtype=DTYPE,device=device)
+        self.ilog=torch.zeros(size=(self.n_sampling_epochs,),dtype=DTYPE,device=device)
+        
+        
+        self.check_convergence=check_convergence
+        self.sampling_epochs_to_check_convergence=sampling_epochs_to_check_convergence
+        self.sampling_epochs_with_worse_loss_for_convergence=sampling_epochs_with_worse_loss_for_convergence
+        self.out_sampling_epochs=None
+        
+    def __call__(self,epoch,tX,ky,n) : 
+        if epoch not in self.sampling_epochs: return False
+    
+        if epoch in self.sampling_epochs: 
+            yhat,weights=self.model(tX,return_weights=True)
+            loss=self.losser(yhat,ky.ravel(),weights,n)
+            self.wlog[self.se,:]=weights.reshape(1,-1)
+            self.llog[self.se]=loss
+            self.ilog[self.se]=self.model.intercept.detach()
+            
+            if self.se > self.sampling_epochs_to_check_convergence and self.check_convergence : 
+                concheck=(self.llog[self.se-self.sampling_epochs_to_check_convergence:self.se] < loss).sum()
+                # this loss is greater(=worse) than this many of the previous epochs
+                if concheck > self.sampling_epochs_with_worse_loss_for_convergence : 
+                    convergence_status=True
+                    self.wlog=self.wlog[:self.se+1,:]
+                    self.llog=self.llog[:self.se+1]
+                    self.ilog=self.ilog[:self.se+1]
+                    self.out_sampling_epochs=self.sampling_epochs[:self.se+1]
+                    return True
+                    
+            self.se +=1
+            
+        return False
+            
+            
+    def wrap(self) : 
+        if self.n_sampling_epochs > 1 : 
+            npwlog=self.wlog.cpu().detach().numpy()
+            npllog=self.llog.cpu().detach().numpy()
+            npilog=self.ilog.cpu().detach().numpy()
+        else : 
+            yhat,weights=self.model(tX,return_weights=True)
+            npllog=self.losser(yhat,ky.ravel(),weights,n).cpu().detach().numpy()
+            npwlog=weights.cpu().detach().numpy()
+            npilog=self.ilog.cpu().detach().numpy()
+            
+            if self.out_sampling_epochs is None :
+                self.out_sampling_epochs =self.sampling_epochs
+            
+        return self.out_sampling_epochs,npllog,npwlog,npilog
+
+
+def aic_w(w,b0,X,y,n) : 
+    eps=np.finfo(w.dtype).eps
+    ak=( w > eps).sum()
+    phat=np.clip(
+            expit(
+                np.matmul(X,w)+b0
+            ),
+            eps,
+            1-eps
+    )
+    ll=binom.logpmf(
+        y,
+        n,
+        phat).sum()
+
+    aicn=X.shape[0]
+    
+    criterion=2*ak - 2*ll + 2*ak*(ak+1)/max(aicn-1-ak,aicn/ak)
+    
+    return AICResult(criterion,ak,ll,n)
 
     
+def run_model(lg,
+                   strengths,
+                   masks,
+                   global_feature_mask=None,
+                   patient_indices=None,
+                   max_epochs=2001,
+                   n_sampling_epochs=401,
+                   lr=1e-2,
+                   lgbfs_kwargs=_default_lgbfs_kwargs,
+                   device=DEVICE,
+                   check_convergence=True,
+                   recalc_J=False,
+                   init_vals=None,
+                   init_intercept=None,
+                   score_by_train=True
+                  ) : 
+
+    
+    if  init_vals is None : 
+        init_vals,init_intercept=lg.guess_weights()
+        if global_feature_mask is not None : 
+            init_vals=init_vals[
+                        torch.tensor(global_feature_mask,device=DEVICE,dtype=torch.bool)
+                        ]
+
+    elif init_intercept is None : 
+        init_intercept=-5
+
+    if global_feature_mask is not None : 
+        tX=mask_sparse_columns(lg.X.clone(),torch.tensor(global_feature_mask,device=DEVICE,dtype=torch.bool)).coalesce()
+    else : 
+        tX=lg.X
+
+
+
+    if patient_indices is not None : 
+        outside_pat_indices=lg._t_pat_indices[ ~torch.isin(lg._t_pat_indices,patient_indices) ]
+        itx,iky=lg.build_xy_from_subset(gene_indices=None,patient_indices=patient_indices,recalc_J=recalc_J,renormalize_X=recalc_J)
+        ni=torch.tensor(len(patient_indices),device=DEVICE,dtype=torch.int)
+        if not score_by_train : 
+            otx,oky=lg.build_xy_from_subset(gene_indices=None,patient_indices=outside_pat_indices)
+            no=torch.tensor(len(outside_pat_indices),device=DEVICE,dtype=torch.int)
+    else : 
+        itx=tX
+        otx=tX
+        iky=torch.tensor(lg.y.values,device=DEVICE,dtype=torch.float)
+        ni=torch.tensor(lg.omics.shape[0],device=DEVICE,dtype=torch.int)
+        if not score_by_train : 
+            oky=torch.tensor(lg.y.values,device=DEVICE,dtype=torch.float)
+            no=torch.tensor(lg.omics.shape[0],device=DEVICE,dtype=torch.int)
+
+    assert tX.shape[1] == init_vals.shape[0]
+        
+    model=LARGeSSE_Logprob(tX.shape[1],init_vals=init_vals,init_intercept=init_intercept)
+    losser=MultiPenaltyBinomialLoss(strengths=strengths,masks=masks)
+    optimizer=torch.optim.LBFGS(model.parameters(),lr=lr,**lgbfs_kwargs)
+    sampling_epochs=np.cast['int'](np.linspace(0,max_epochs-1,n_sampling_epochs)//1.0)
+    logger=Logger(model,losser,sampling_epochs,tX.shape[1],check_convergence=True)
+
+    for epoch in range(max_epochs): 
+
+        def closure() : 
+            torch.nn.utils.clip_grad_norm_(model.parameters(),5)
+            optimizer.zero_grad()
+            yhat,weights=model(tX,return_weights=True)
+            loss=losser(yhat,iky,weights,ni)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+
+        if score_by_train : 
+            if convergence_status := logger(epoch,tX,iky,ni) : break
+        else : 
+            if convergence_status := logger(epoch,tX,oky,no) : break
+    else : 
+        convergence_status=False
+
+    ose,llog,wlog,ilog=logger.wrap()
+    output=OptimizerResult(
+            loss=llog,
+            weight=wlog,
+            intercept=ilog,
+            strengths=strengths,
+            masks=masks,
+            sampling_epochs=ose,
+            max_epochs=max_epochs,
+            lr=lr,
+            lbgfs_kwargs=lgbfs_kwargs,
+            convergence_status=convergence_status
+            )
+
+    return output
+
+
+def optimize_regstrength_gradient(
+        lg,
+        globalmask,
+        masks,
+        strengths,
+        tweakwhichstrength,
+        nkfsplits=5,
+        lr=1e-3,
+        grad_floor=0.1,
+        max_epochs_per_run=2001,
+        n_sampling_epochs=201,
+        convergence_timeout=15
+    ) : 
+
+    kf=KFold(n_splits=nkfsplits)
+    xnp=lg.X.cpu().to_dense().numpy()
+    sfxnp=xnp[:,globalmask]
+
+    init_rs=strengths[tweakwhichstrength]
+    lastcmean=np.inf
+
+    init_vals,init_intercept=lg.guess_weights()
+
+    criteria=np.zeros((nkfsplits,))
+
+    loggertable=pd.DataFrame(
+                            columns=[
+                                  'metaepoch',
+                                  'fold',
+                                  'regstrength',
+                                  'criterion',
+                                  'dv',
+                                  'elapsed',
+                                  'mean_vel',
+                                  'nparams',
+                              ]
+                            )
+
+
+    ofinterest=np.zeros((0,),dtype=np.int32)
+
+    metaepoch=0
+    grad=0.3
+    starttime=time.time()
+    dv=1
+    lastfivedvs=np.ones((5,))
+    try : 
+        while not (metaepoch > 2 and np.abs(np.mean(lastfivedvs)) < grad_floor ) : 
+            for e,(itr,ite) in enumerate(kf.split(lg.omics.values)) : 
+
+                patient_indices=torch.tensor(itr,device=DEVICE,dtype=torch.int)
+
+                optres=run_model(lg,
+                                 strengths=strengths,
+                                 global_feature_mask=globalmask,
+                                 masks=masks,
+                                 patient_indices=patient_indices,
+                                 lr=lr,
+                                 max_epochs=max_epochs_per_run,
+                                )
+
+
+                ynp=lg.omics.values[ite,:].sum(axis=0)
+
+                aicres=aic_w(optres.weight[optres.loss.argmin(),:],
+                           optres.intercept[optres.loss.argmin()],
+                           sfxnp,
+                           ynp,
+                           len(ite)
+                          )
+
+                if metaepoch == 0 : 
+                    grad=1
+                else : 
+                    dys=aicres.criterion - loggertable.query("fold == @e").criterion.values
+                    dxs=strengths[tweakwhichstrength] - loggertable.query("fold == @e").regstrength.values
+                    dyx=dys/dxs
+                    dyx[ np.isnan(dyx) | (dyx == 0)]=0
+                    weights=np.clip(np.abs(1/dxs/dxs),1e-7,1e2)
+                    weights[ np.isnan(weights) | (weights == 0) | np.isinf(weights) ]=0
+                    grad=(dyx*weights).sum()/weights.sum() 
+                    assert not np.isnan(grad) and not np.isinf(grad) and not np.isinf(-1*grad)
+                    # this value will be positive if positive shifts increase criteria
+                    # this is the shift in AIC strength from a change in regularization strength of one
+                    #  dv used to be grad/2
+
+
+
+                #factor=np.power(decel,metaepoch)
+
+                if metaepoch  > 0 : 
+                    dv = (dv-3*np.sin(np.arctan(grad)))/np.log(metaepoch+5)
+                    assert not np.isnan(dv) and not np.isinf(dv) and not np.isinf(-1*dv)
+                else : 
+                    dv=0
+                    if e ==  ( nkfsplits -1 )  : 
+                        strengths[tweakwhichstrength] = init_rs *1.25
+
+                best_epoch_this=optres.loss.argmin()
+                best_weights_this=optres.weight[ best_epoch_this] 
+                eps=np.finfo(np.float32).eps
+
+                nparams=(best_weights_this> eps).sum()
+
+                ofinterest=np.union1d(ofinterest,np.argwhere(best_weights_this > eps).ravel())
+
+                last=pd.Series(dict(
+                                   metaepoch=metaepoch,
+                                   fold=int(e),
+                                   regstrength=strengths[tweakwhichstrength],
+                                   criterion=aicres.criterion,
+                                   dv=dv,
+                                   elapsed=int(time.time()-starttime//1.0),
+                                   mean_vel=np.mean(lastfivedvs),
+                                   nparams=nparams,
+                               ))
+
+                last.name='{: >2}:{: >3}'.format(metaepoch,e)
+                if loggertable.shape[0]  < 1: 
+                    loggertable=pd.DataFrame([last])
+                else: 
+                    loggertable=pd.concat([loggertable,pd.DataFrame([last])],axis=0) 
+
+                import __main__ as main
+                if hasattr(main,'__file__') : 
+                    print(loggertable.tail(1))
+                else: 
+                    display(loggertable.tail(10),clear=True)
+
+
+                if metaepoch > 0 : 
+                    if aicres.k == 0 : 
+                        strengths[tweakwhichstrength] = abs(strengths[tweakwhichstrength])/5
+                    else : 
+                        strengths[tweakwhichstrength] = max([strengths[tweakwhichstrength] + dv ,abs(strengths[tweakwhichstrength])/2])
+
+
+                    lastfivedvs[:-1]=lastfivedvs[1:]
+                    lastfivedvs[-1]=dv
+
+            if metaepoch > convergence_timeout : break
+            metaepoch += 1
+
+        print('Done.')
+    except KeyboardInterrupt : 
+        print(dys)
+        print(dxs)
+        print(dyx)
+        print(weights)
+        print(grad)
+        print(dv)
+        return loggertable,ofinterest
+
+    return loggertable,ofinterest
+
+
+
+def do_burn_in(lg,settings) : 
+
+    j_regstrength=settings.j_regstrength
+    regstrength=settings.burn_init_regstrength
+
+    fts=lg.featuretypes()
+    notagene=( fts != 'gene')
+    isagene= ~notagene
+    isasystem=(fts == 'system')
+    notasystem=~isasystem
+
+    burnintable,ofinterest_nogenes=optimize_regstrength_gradient(
+                                        lg,
+                                        globalmask=notagene,
+                                        masks=(isasystem[notagene],(~isasystem)[notagene]),
+                                        strengths=[regstrength,j_regstrength],
+                                        tweakwhichstrength=0,
+                                        lr=settings.burn_lr,
+                                        grad_floor=settings.burn_grad_floor,
+                                        max_epochs_per_run=settings.burn_max_epochs_per_run,
+                                        n_sampling_epochs=settings.burn_n_sampling_epochs_per_run,
+                                        convergence_timeout=settings.burn_convergence_timeout,
+                                    )
+
+    # registering this back to the full shape, since ofinterest_nogenes has no genes
+    full_feat_index=np.arange(lg.X.shape[1])
+    nogeneindex=full_feat_index[notagene]
+    ofinterest_full=nogeneindex[ofinterest_nogenes]
+
+    burnintable=burnintable.assign(fold=pd.Categorical(burnintable.fold.astype(int),categories=np.unique(np.cast['int'](burnintable.fold.values))))
+    cfmax=burnintable.groupby('fold').criterion.max()
+    cfmin=burnintable.groupby('fold').criterion.min()
+    burnintable['cfmax']=cfmax.reindex(burnintable.fold).values
+    burnintable['cfmin']=cfmin.reindex(burnintable.fold).values
+    burnintable['cnorm']=(burnintable.criterion-burnintable.cfmin)/(burnintable.cfmax-burnintable.cfmin)
+    burnintable['dc']=(burnintable.criterion-burnintable.cfmax)
+
+    consensus_regstrength=(-1*burnintable.dc*burnintable.regstrength).sum()/(-1*burnintable.dc).sum()
+    ostrengths=[settings.j_regstrength,consensus_regstrength]
+    # You need to do another model run without the hierarchy but **with** genes in order to figure out which
+    # could possibly matter.
+
+    initw,initi=lg.guess_weights()
+
+    msg('Sampling no-hierarchy runs...')
+    oi_genes=list()
+    from tqdm.auto import tqdm
+    for x in tqdm(range(settings.burn_n_noh_runs),total=settings.burn_n_noh_runs) : 
+        patient_indices=lg.sample_patients(frac=0.8)
+        aux_optres=run_model(
+                    lg,
+                    strengths=ostrengths,
+                    masks=(isagene[notasystem],(~isagene)[notasystem]),
+                    global_feature_mask=notasystem,
+                    lr=settings.burn_lr,
+                    init_vals=initw[notasystem],
+                    init_intercept=initi,
+                    patient_indices=patient_indices,
+                   )
+        oi_genes.append(np.argwhere(aux_optres.weight[aux_optres.loss.argmin()] > 0 ).ravel())
+
+    for x in range(settings.burn_n_noh_runs) : 
+        oi_genes[x]=full_feat_index[notasystem][oi_genes[x]]
+
+    ofinterest=reduce(np.union1d,[ofinterest_full]+oi_genes)
+                                    
+    return BurnInResult(frame=burnintable,
+                        ofinterest=ofinterest,
+                        strengths=ostrengths)
+
+def do_bootstrapping(lg,
+                     ofinterest,
+                     strengths,
+                     settings,
+                    ):
+
+    bootwlog=np.zeros((settings.n_boot_runs,len(ofinterest)))
+    from tqdm.auto import tqdm
+
+    isgeneorsystem  =   np.isin(lg.featuretypes(),np.array(['gene','system']))
+    issig           =   ~isgeneorsystem
+    wasofinterest   =   np.isin(np.arange(lg.X.shape[1]),ofinterest)
+
+    feats=lg.features()
+
+    for i in tqdm(range(settings.n_boot_runs)) : 
+
+        patient_indices=lg.sample_patients(frac=settings.boot_patient_resampling_fraction)
+        demo_bs=run_model(lg,
+                          strengths=strengths,
+                          masks=[ isgeneorsystem[wasofinterest] , issig[wasofinterest]  ],
+                          global_feature_mask=wasofinterest,
+                          patient_indices=patient_indices,
+                          max_epochs=settings.boot_max_epochs,
+                          n_sampling_epochs=settings.boot_n_sampling_epochs,
+                          lr=settings.boot_lr,
+                      )
+
+        bootwlog[i,:]=demo_bs.weight[demo_bs.loss.argmin()]
+    
+        if settings.save_tmps : 
+            torch.save(demo_bs,kg.opj(settings.tmpprefix,settings.jobprefix+'_boot_{:0>4}.pt'.format(i)))
+
+    return bootwlog
+
+def assemble_lg(settings) : 
+
+    if not hasattr(settings,'custom_omics') or not settings.custom_omics is None : 
+        omics,msig=prep_guts(settings.tcga_directory,settings.mutation_signature_path)
+    else : 
+        msig=pd.read_csv(settings.mutation_signature_path,index_col=0) ;
+        omics=pd.read_csv(settings.custom_omics,index_col=0)
+
+    lengths,timings=load_protein_datas()
+
+    os.makedirs(settings.output_directory,exist_ok=True)
+    import pickle
+    with open(settings.hierarchy_path,'rb') as f : 
+        hier=pickle.load(f)
+
+    lg=LARGeSSE_G(omics=omics,signatures=msig,lengths=lengths,timings=timings)
+    lg._assign_hierarchy(hier,system_limit_upper=settings.hsystem_limit_upper,system_limit_lower=settings.hsystem_limit_lower)
+    sp_IH=lg.build_IH(inplace=True,weight=False)
+    sp_J=lg.build_J(inplace=True,correlation_p=settings.correlation_p)
+    X=lg.build_X(normalize=True,inplace=True)
+
+    return lg
+
+def main_script_process(settings): 
+
+    lg=assemble_lg(settings) 
+    # interpretation-- you are trying to find the signature regularization strengths
+    fts=lg.featuretypes()
+    if len(hier) < 1 : 
+        regstrength=settings.burn_init_regstrength
+
+        isasig=( fts != 'gene') & (fts != 'system')
+
+        burnintable_sigonly,ofinterest_sigonly=optimize_regstrength_gradient(
+                                            lg,
+                                            globalmask=isasig,
+                                            masks=(isasig[isasig],),
+                                            strengths=[regstrength,],
+                                            tweakwhichstrength=0,
+                                            lr=settings.burn_lr,
+                                            grad_floor=settings.burn_grad_floor,
+                                            max_epochs_per_run=settings.burn_max_epochs_per_run,
+                                            n_sampling_epochs=settings.burn_n_sampling_epochs_per_run,
+                                            convergence_timeout=settings.burn_convergence_timeout,
+                                        )
+
+        burnintable_sigonly=burnintable_sigonly.assign(fold=pd.Categorical(burnintable_sigonly.fold.astype(int),categories=np.unique(np.cast['int'](burnintable_sigonly.fold.values))))
+        cfmax=burnintable_sigonly.groupby('fold').criterion.max()
+        cfmin=burnintable_sigonly.groupby('fold').criterion.min()
+        burnintable_sigonly['cfmax']=cfmax.reindex(burnintable_sigonly.fold).values
+        burnintable_sigonly['cfmin']=cfmin.reindex(burnintable_sigonly.fold).values
+        burnintable_sigonly['cnorm']=(burnintable_sigonly.criterion-burnintable_sigonly.cfmin)/(burnintable_sigonly.cfmax-burnintable_sigonly.cfmin)
+        burnintable_sigonly['dc']=(burnintable_sigonly.criterion-burnintable_sigonly.cfmax)
+
+        consensus_regstrength=(-1*burnintable_sigonly.dc*burnintable_sigonly.regstrength).sum()/(-1*burnintable_sigonly.dc).sum()
+
+
+        burnintable_sigonly.to_csv('sigonly_burn_in.csv')
+
+    else : 
+
+        gene_mask= (fts == 'gene')
+        system_mask= (fts == 'system') 
+        sig_mask = ~gene_mask & ~system_mask
+        nonsig_mask =  gene_mask | system_mask
+
+        msg('Burn-in:')
+        bir=do_burn_in(lg,settings)
+        torch.save(bir,opj(settings.output_directory,'burnin.pt'))
+
+        msg('Running main model...')
+
+        init_w,init_i=lg.guess_weights()
+        
+        mainout=run_model(lg,
+                            strengths=bir.strengths,
+                            masks=(nonsig_mask,sig_mask),
+                            lr=settings.main_lr,
+                            max_epochs=settings.main_max_epochs,
+                            init_vals=init_w,
+                            init_intercept=init_i,
+                            )
+
+        torch.save(mainout,opj(settings.output_directory,'main.pt'))
+
+        msg('Running matched null model...')
+        
+        matchnullout=run_model(lg,
+                            strengths=bir.strengths,
+                            masks=(nonsig_mask[~system_mask],sig_mask[~system_mask]),
+                            lr=settings.main_lr,
+                            max_epochs=settings.main_max_epochs,
+                            init_vals=init_w[~system_mask],
+                            init_intercept=init_i,
+                            global_feature_mask=(~system_mask),
+                            )
+
+        torch.save(matchnullout,opj(settings.output_directory,'matched_null.pt'))
+
+        msg('Getting bootstrap values..')
+
+        full_feat_index=np.arange(lg.X.shape[1])
+
+        ofinterest=reduce(np.union1d,
+                [bir.ofinterest,
+                 np.argwhere(mainout.weight[mainout.loss.argmin()] > 0).ravel(),
+                 full_feat_index[np.argwhere(matchnullout.weight[matchnullout.loss.argmin()] > 0).ravel()],
+                 ])
+
+        bootout=do_bootstrapping(lg,ofinterest,bir.strengths,settings)
+
+        torch.save(bootout,opj(settings.output_directory,'boot.pt'))
+
+        msg('Saving most matrices...')
+        if settings.save_tmps :
+            tocollect=sorted([ kg.opj(settings.tmpprefix,fp) for fp in os.listdir(settings.tmpprefix) 
+                                if fp.startswith(settings.jobprefix+'_boot') and fp.endswith('.pt')])
+            tmps=list()
+            for tc in tocollect : 
+                tmps.append(torch.load(tc))
+            torch.save(tmps,opj(settings.output_directory,'boot_individuals.pt'))
+
+        torch.save(settings,opj(settings.output_directory,'settings.pt'))
+
+        torch.save(X.cpu(),opj(settings.output_directory,'X.pt'))
+
+        np.savez(
+            opj(settings.output_directory,'arrays.npz'),
+            y=lg.y.values,
+            feats=lg.features(),
+            featuretypes=lg.featuretypes(),
+            ylabels=np.array(lg.y.index),
+            n=torch.tensor(len(lg.patients)),
+            ofinterest_full=ofinterest,
+        )
+
+        msg('Scoring spoofed hierarchies...')
+        waitbar=tqdm(total=2*settings.n_spoofs)
+        waitbar.display()
+        for pref,tf in zip(['fake','wild'],[True,False]) : 
+            for x in range(settings.n_spoofs) : 
+                thisspdir=opj(settings.output_directory,pref+'_'+str(x))
+                os.makedirs(thisspdir,exist_ok=True)
+                sh=spoof(lg.hierarchy,preserve_rowsums=True)
+                lgspoof=LARGeSSE_G(omics=omics,signatures=msig,lengths=lengths,timings=timings)
+                lgspoof._assign_hierarchy(sh,system_limit_upper=settings.hsystem_limit_upper,system_limit_lower=settings.hsystem_limit_lower)
+                sp_IH=lgspoof.build_IH(inplace=True,weight=False)
+                sp_J=lgspoof.build_J(inplace=True,correlation_p=settings.correlation_p)
+                X=lgspoof.build_X(normalize=True,inplace=True)
+                
+                spooffeaturetypes=lgspoof.featuretypes()
+                spoofsigmask=( spooffeaturetypes != 'gene')  & ( spooffeaturetypes != 'system')
+                
+                splog=run_model(
+                                lgspoof,
+                                strengths=bir.strengths,
+                                masks=(~spoofsigmask,spoofsigmask),
+                                lr=settings.spoof_lr,
+                                )
+                
+                torch.save(X,opj(thisspdir,'spX.pt'))
+                torch.save(splog,opj(thisspdir,'logger.pt'))
+                waitbar.update()
+        waitbar.close()
+
+
 if __name__ == '__main__' : 
+    if len(sys.argv) > 1 : 
+        runjson=sys.argv[1]
+        with open(runjson) as f : 
+            settings=Settings(**json.load(f))
 
-    import os
-    import sys
-    rules=ns.rules
-    hpath=ns.hierarchy
-
-    n_repeats=int(ns.n_repeats)
-    bir_repeats=int(ns.burn_in_repeats)
-    sample_factor=float(ns.sample_factor)
-    php=int(ns.post_hoc_power)
-    j_stringency=10**(-1*float(ns.j_stringency))
-
-    hname='.'.join(hpath.split(os.path.sep)[-1].split('.')[:-1])
-    outpath=ns.outpath
-    if not os.path.exists(outpath) : 
-        os.mkdir(outpath)
-
-    msg('Reading in gene data',end='')
-    lengths,coord=load_protein_datas()
-    msg('Done.')
-
-    #~~~~~~~~Read in hierarchy and omics~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-
-    msg(f"Reading in hierarchy from {hpath}...",end='')
-    msg(f"Reading in omics from LUAD COHORT...",end='')
-    with warnings.catch_warnings() : 
-        warnings.simplefilter('ignore')
-        lg=lt_to_lg(hpath,
-            kg.opj(rules,'logittransformer.pickle'),
-            loglengths=lengths,
-            timing_coordinates=coord,
-            j_stringency=j_stringency,
-            
-)
-    lg.samplefactor=sample_factor
-    lg.j_stringency=j_stringency
-    msg('Done.')
-
-    with open(opj(outpath,'lg.pickle'),'wb') as f : 
-        pickle.dump(lg,f)
-
-    bxdf=pd.DataFrame(data=lg.X,index=lg.omics.columns,columns=lg.features)
-
-
-
-    #~~~~~~~~BURN-IN analysis~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # the goal is to get an estimate of alpha  for this hierarchy
-    # as well as to define the space of coefficients actually being tested
-
-
-    msg("Running burn-in analysis...",end='')
-    bir=burn_in(lg,n_repeats=bir_repeats)
-    with open(opj(outpath,'burnin.pickle'),'wb') as f: 
-        pickle.dump(bir,f)
-
-    alpha_empir,ofinterest_i=burninpost(bir)
-    alpha_theor=np.log10(lg.omics.shape[0]/(lg.omics.shape[0]-1))
-    msg('Empirical alpha (regularization strength) of {:0>4.2e} '.format(alpha_empir))
-    msg('Theoretical alpha (single-coefficient limit) of {:0>4.2e} '.format(alpha_theor))
-    msg('Done.')
-
-    msg("Dissecting burn-in...",end='')
-    crundata=burnin_dissection(bir)
-    crundata.to_csv(opj(outpath,'burnin_dissection.csv'))
-    msg("Done.")
-
-    np.savez(opj(outpath,'ofinterest_i.npz'),ofinterest_i)
-    #.....................................................................
-
-    #~~~~~~~~Main analysis~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    msg("Performing main run...",end='')
-    coremodel=LassoLars(alpha=alpha_empir,positive=True,fit_intercept=False)
-    coremodel.fit(lg.U[:,ofinterest_i],lg.y)
-    #ofinterest_i2=ofinterest_i[coremodel.coef_ > 0]
-
-    mr=mainrun(lg,alpha_empir,ofinterest_i,n_runs=n_repeats)
-    with open(opj(outpath,'mainrun.pickle'),'wb') as f : 
-        pickle.dump(mr,f)
-    with open(opj(outpath,'coremodel.pickle'),'wb') as f : 
-        pickle.dump(coremodel,f)
-    msg("Done.")
-    #.....................................................................
-
-    #~~~~~~~~Bootstrapping for nonzero value and confidence interval~~~~~~
-    msg("Skipping post-run analysis [WIP]. Done.")
-    #msg("Performing post-run analysis...",end='')
-    #pra=post_run_analysis(lg,ofinterest_i,mr,alpha_theor,php=php)
-    #pra.to_csv(opj(outpath,'post_run_analysis.csv'))
-    #msg("Done.")
-    #.....................................................................
-
+        main_script_process(settings) ; 
+    else : 
+        pass

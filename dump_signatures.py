@@ -39,11 +39,15 @@ aliquotpath=opj(casedatapath,'aliquot.tsv')
 thiscohortpath=opj(kgc['signature_folder_prefix'],'cohort_'+cl)
 
 cbioportal_path=opj(kgc['cbioportal_folder_prefix'],cl+'_tcga_pan_can_atlas_2018')
+if not os.path.exists(cbioportal_path) : 
+    cbioportal_path=opj(kgc['cbioportal_folder_prefix'],cl+'_tcga_pub')
+
+if not os.path.exists(cbioportal_path) : 
+    cbioportal_path=opj('/cellar/users/mrkelly/Data/canon/old_cbioportal',cl+'_tcga_pan_can_atlas_2018')
+
 
 
 SIGNATURE_INNARDS=opj('Assignment_Solution','Activities')
-#TODO: this needs to get  moved into its own script that saves the signature/arm frame
-# then, that frame needs to be read and pointed to in this script
 #~~~~~~~~Read in and format omics signatures~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 print('Loading signatures...',end='')
 if cu == 'COADREAD' : 
@@ -91,3 +95,6 @@ msigframe=msigframe[ msigframe.columns[(msigframe!=0).sum().gt(0)] ]
 print('Done.')
 
 msigframe.to_csv(opj(outpath,'mutation_signatures.csv'))
+
+pd.read_csv(opj(thiscohortpath,'mutations.maf'),index_col=0,sep='\t').to_csv(opj(outpath,'mutations.maf'),sep='\t')
+
