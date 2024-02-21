@@ -48,6 +48,8 @@ if not os.path.exists(cbioportal_path) :
 
 
 SIGNATURE_INNARDS=opj('Assignment_Solution','Activities')
+#TODO: this needs to get  moved into its own script that saves the signature/arm frame
+# then, that frame needs to be read and pointed to in this script
 #~~~~~~~~Read in and format omics signatures~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 print('Loading signatures...',end='')
 if cu == 'COADREAD' : 
@@ -95,6 +97,3 @@ msigframe=msigframe[ msigframe.columns[(msigframe!=0).sum().gt(0)] ]
 print('Done.')
 
 msigframe.to_csv(opj(outpath,'mutation_signatures.csv'))
-
-pd.read_csv(opj(thiscohortpath,'mutations.maf'),index_col=0,sep='\t').to_csv(opj(outpath,'mutations.maf'),sep='\t')
-

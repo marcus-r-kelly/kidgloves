@@ -98,6 +98,8 @@ def modgen(ra) :
 
     for p in paths : 
         match p : 
+            case 'xval' :
+                pass
             case 'main' : 
                 yield ('main',ra.main,ra.X,ra.y,ra.n)
             case 'null' : 
@@ -106,6 +108,13 @@ def modgen(ra) :
                 yield (p,torch.load(opj(ra.path,p,'logger.pt')),torch.load(opj(ra.path,p,'spX.pt'),map_location=torch.device('cpu')),ra.y,ra.n)
 
 def score_optres_and_x(p,optres,X,y,n) : 
+
+    if not torch.is_tensor(y)  : 
+        if hasattr(y,'values') : 
+            #quacks like a pandas.Series
+            y=torch.tensor(y.values)
+        else:
+            y=torch.tensor(y)
     bw,bi=best_of_or(optres)
     return taic(torch.tensor(bw),torch.tensor(bi),X,y,n)
 
@@ -159,6 +168,10 @@ def best_of_or(optres) :
     return wt,i
 
 
+
+
+
+
 class RunAnalysis(object) : 
     
     def __init__(self,**kwargs) : 
@@ -197,6 +210,7 @@ class RunAnalysis(object) :
         X=torch.load(kg.opj(path,'X.pt'))
         with open(settings.hierarchy_path,'rb') as f : 
             hier=pickle.load(f)
+
         wx=largesse_g.mask_sparse_columns(
                 X,
                 torch.isin(
@@ -204,6 +218,7 @@ class RunAnalysis(object) :
                     torch.tensor(bir.ofinterest)
                 )
             )
+
         arrays=dict(
                 y=torch.tensor(npz['y'],device=largesse_g.CPU),
                 feats=npz['feats'],
@@ -229,7 +244,7 @@ class RunAnalysis(object) :
         return torch.special.expit(self.predict_odds(weights,intercept))
 
     def predict_odds(self,weights,intercept) : 
-        if len(weights) < self.X.shape[1] : 
+        if len(self.weights) < self.X.shape[1] : 
             return torch.matmul(self.wx,weights)+intercept
         else: 
             return torch.matmul(self.X,weights)+intercept
@@ -314,13 +329,54 @@ class RunAnalysis(object) :
 
         if not hasattr(self,'feature_stats') or self.feature_stats is None: 
             self.get_feature_stats()
-            
         fs=self.feature_stats.reset_index(drop=False)
         fs=fs.rename(columns={'index' : 'node_name'})
 
         nodeframe=pd.concat([ nodeframe_events,fs ],axis=0).reset_index(drop=True)
 
         return edgeframe,nodeframe
+
+    def assemble_xval_summary(self,omics) : 
+
+        xvaldir=kg.opj(self.settings.output_directory,'xval')
+        splits=sorted([ fn for fn  in os.listdir(xvaldir) if fn.startswith('splits_') ])
+        X=self.X
+
+        nullmask=(self.featuretypes != 'system')
+        Xn=largesse_g.mask_sparse_columns(X,torch.tensor(nullmask))
+        xval_summary_data=list()
+
+        for sp in splits: 
+            spno=sp.split('.')[0].split('_')[1]
+            tr,te=torch.load(os.path.join(xvaldir,sp))
+            orfull=torch.load(os.path.join(xvaldir,'xval_full_'+spno+'.pt'))
+            ornull=torch.load(os.path.join(xvaldir,'xval_null_'+spno+'.pt'))
+            ytr=omics.reindex(tr).sum().reindex(self.ylabels).fillna(0)
+            yte=omics.reindex(te).sum().reindex(self.ylabels).fillna(0)
+            
+            stats_full_tr=score_optres_and_x(xvaldir,orfull,X,ytr,len(tr))
+            stats_full_te=score_optres_and_x(xvaldir,orfull,X,yte,len(te))
+            stats_null_tr=score_optres_and_x(xvaldir,ornull,Xn,ytr,len(tr))
+            stats_null_te=score_optres_and_x(xvaldir,ornull,Xn,yte,len(te))
+            
+            results=[ stats_full_tr, stats_full_te, stats_null_tr, stats_null_te, ]
+            modelclasses=['full','full','null','null']
+            patientgroups=['train','test','train','test']
+            
+            subf=pd.DataFrame(results)
+            subf['modelclasses']=modelclasses
+            subf['patient_groups']=patientgroups
+            subf['fold']=spno
+            
+            xval_summary_data.append(subf)
+
+        xvdf=pd.concat(xval_summary_data).reset_index(drop=True)
+        xvdfp=xvdf.pivot(index=['fold','patient_groups'],columns='modelclasses',values='criterion')
+        xvdf=xvdf.merge((xvdfp.full-xvdfp.null).rename('dAIC').reset_index(),on=['fold','patient_groups'],how='left')    
+
+        self.xvdf=xvdf
+        return xvdf
+
 
 def is_possible_child(hier,parent,child) :
     return (len(hier[child] - hier[parent]) == 0 )
@@ -541,5 +597,4 @@ def onco_hbar_split(ocpiv,figsize=(0.5,3),transition=15) :
 
 def stripsuf(s) : 
     return s.split('_')[0]
-
 

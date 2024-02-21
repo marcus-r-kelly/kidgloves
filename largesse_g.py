@@ -92,18 +92,27 @@ def _fix_overlong_identifiers(df,index=True) :
 
     return df
 
-def prep_guts(tcga_directory,mutation_signature_path) :
-    #TODO-- find out why you have lost 6 patients
+def prep_guts(omics_table,mutation_signature_path) :
+    omics=_fix_overlong_identifiers(pd.read_csv(omics_table,index_col=0))
+    msig=_fix_overlong_identifiers(pd.read_csv(mutation_signature_path,index_col=0))
+    pats=np.intersect1d(omics.index,msig.index)
+    #FUTURE : this might not stricly be necessary? What matters is that you know the correlations for each gene
+    #Therefore, assuming those are not invariant for patients where you just have regular and not allele-specific CNA data
+    #You are probably OK to use more patients
+    # AS LONG AS you compile omics from other things
+    return omics.reindex(pats),msig.reindex(pats)
+    
+
+def _prep_guts_legacy(tcga_directory,mutation_signature_path) :
     omics=kg.autoload_events(tcga_directory,heuristic=False,n2keep=0,mutations_from=opj(os.path.split(mutation_signature_path)[0],'mutations.maf'))
     msig=pd.read_csv(mutation_signature_path,index_col=0)
-    tms=torch.tensor(msig.values)
     omics=_fix_overlong_identifiers(omics)
     omics=omics.reindex(msig.index)
 
     return omics,msig
 
 def load_protein_datas() : 
-    #TODO : customize script to accommodate different timings
+    #FUTURE : customize script to accommodate different timings
 
     if kg._s2e is None : 
         kg._get_geneinfo()
@@ -255,21 +264,21 @@ class LARGeSSE_G(object) :
         self.lengths=lengths.copy()
         self.lengths.index=np.vectorize(lambda s : s+'_mut')(self.lengths.index)
         self.lengths=self.lengths.reindex(self.full_index).fillna(0)
-        self.t_lengths=torch.tensor(self.lengths.values,dtype=DTYPE,device=self.device)
+        self.t_lengths=torch.tensor(self.lengths.values,dtype=DTYPE,device=CPU)
 
     def _assign_timings(self,timings) : 
         assert hasattr(self,'omics')
         self.timings=timings.copy()
         self.timings.index=np.vectorize(lambda s : s+'_mut')(self.timings.index)
         self.timings=self.timings.reindex(self.full_index).fillna(0)
-        self.t_timings=torch.tensor(self.timings.values,dtype=DTYPE,device=self.device)
+        self.t_timings=torch.tensor(self.timings.values,dtype=DTYPE,device=CPU)
 
     def _assign_hierarchy(self,hierarchy,system_limit_upper=2000,system_limit_lower=4) : 
         assert hasattr(self,'omics')
         assert hasattr(self,'y')
 
         self.hierarchy={ k : v for k,v in hierarchy.items()
-                            if len(v) < system_limit_upper and len(v) > system_limit_lower }
+                            if len(v) < system_limit_upper and len(v) >= system_limit_lower }
         if len(self.hierarchy) < 1 : 
             self.nmo=None
             self.systems=None
@@ -291,7 +300,7 @@ class LARGeSSE_G(object) :
             indices=np.c_[col_indices,row_indices].transpose(),
             values=np.ones((len(row_indices,))),
             size=(len(ssk),len(self.genes)),
-            device=self.device
+            device=CPU
         ).coalesce().transpose(0,1).float()
 
         self.nmo=torch.sparse.mm(self.ii,sphier)
@@ -309,7 +318,6 @@ class LARGeSSE_G(object) :
         self.omics=_fix_overlong_identifiers(omics).reindex(columns=self.full_index).fillna(0).astype(np.float32)
 
         ltypes=np.r_[*[[lt]*len(self.genes) for lt in ['mut','fus','up','dn']]]
-        #TODO: implement this and verify that it works in the increasingly misnamed "dropout" notebook
         if resolve_cn_conflicts: 
             ltypes=np.r_[*[[lt]*len(self.genes) for lt in ['mut','fus','up','dn']]]
             uptotals=self.omics.values[:,( ltypes == 'up' )].sum(axis=0)+1
@@ -325,16 +333,16 @@ class LARGeSSE_G(object) :
                                     dtype=DTYPE,
                                     device=self.device)
 
-        self._c_omics_mut=torch.tensor(self.omics.columns.str.endswith('_mut'),device=self.device)
-        self._c_omics_fus=torch.tensor(self.omics.columns.str.endswith('_fus'),device=self.device)
-        self._c_omics_up=torch.tensor(self.omics.columns.str.endswith('_up'),device=self.device)
-        self._c_omics_dn=torch.tensor(self.omics.columns.str.endswith('_dn'),device=self.device)
+        self._c_omics_mut=torch.tensor(self.omics.columns.str.endswith('_mut'),device=CPU)
+        self._c_omics_fus=torch.tensor(self.omics.columns.str.endswith('_fus'),device=CPU)
+        self._c_omics_up=torch.tensor(self.omics.columns.str.endswith('_up'),device=CPU)
+        self._c_omics_dn=torch.tensor(self.omics.columns.str.endswith('_dn'),device=CPU)
         self._c_omics_struct= self._c_omics_fus | self._c_omics_up | self._c_omics_dn
 
         self._r_genes=np.vectorize(event2eid)(omics.columns)
         # at each row of **omics**, what gene is being represented?
 
-        self._t_row_indices=torch.arange(len(self._r_genes),device=self.device,dtype=torch.float)
+        self._t_row_indices=torch.arange(len(self._r_genes),device=CPU,dtype=torch.float)
 
         self.build_y()
 
@@ -344,9 +352,9 @@ class LARGeSSE_G(object) :
         cog=dict(zip(self.genes,list(range(len(self.genes)))))
         # eid -> column
         lam=np.vectorize(lambda x : cog[x])
-        iirow_indices=torch.tensor(np.arange(len(self._r_genes)),device=self.device)
+        iirow_indices=torch.tensor(np.arange(len(self._r_genes)),device=CPU)
         # will be slot in on dimension 0 but then tranposed
-        iicol_indices=torch.tensor(lam(self._r_genes),device=self.device)
+        iicol_indices=torch.tensor(lam(self._r_genes),device=CPU)
 
 
         # the columns are genes
@@ -355,17 +363,17 @@ class LARGeSSE_G(object) :
                         indices=torch.stack([iicol_indices,iirow_indices],axis=-1).transpose(0,1),
                         values=iivalues,
                         size=(len(self.genes),len(self._r_genes)),
-                        device=self.device #new
+                        device=CPU,
                   ).coalesce().transpose(0,1).float().coalesce()
 
 
 
     def _assign_signatures(self,signatures) : 
-        self._c_signature_sbs=torch.tensor(signatures.columns.str.startswith('SBS'),device=self.device)
-        self._c_signature_dbs=torch.tensor(signatures.columns.str.startswith('DBS'),device=self.device)
-        self._c_signature_id=torch.tensor(signatures.columns.str.startswith('ID'),device=self.device)
-        self._c_signature_cn=torch.tensor(signatures.columns.str.startswith('CN'),device=self.device)
-        self._c_signature_arm=torch.tensor(signatures.columns.str.startswith('arm_pc'),device=self.device)
+        self._c_signature_sbs=torch.tensor(signatures.columns.str.startswith('SBS'),device=CPU)
+        self._c_signature_dbs=torch.tensor(signatures.columns.str.startswith('DBS'),device=CPU)
+        self._c_signature_id=torch.tensor(signatures.columns.str.startswith('ID'),device=CPU)
+        self._c_signature_cn=torch.tensor(signatures.columns.str.startswith('CN'),device=CPU)
+        self._c_signature_arm=torch.tensor(signatures.columns.str.startswith('arm_pc'),device=CPU)
         self._c_signature_point=self._c_signature_sbs | self._c_signature_dbs | self._c_signature_id
         self._c_signature_region=self._c_signature_cn | self._c_signature_arm
         self.signatures=_fix_overlong_identifiers(signatures).astype(np.float32)
@@ -377,7 +385,7 @@ class LARGeSSE_G(object) :
     def _sync_feeder_indices(self): 
         pats=np.intersect1d(self.omics.index,self.signatures.index)
         self.patients=pats
-        self._t_pat_indices=torch.arange(len(pats),device=self.device,dtype=torch.int)
+        self._t_pat_indices=torch.arange(len(pats),device=CPU,dtype=torch.int)
         self._assign_omics(self.omics.reindex(pats))
         self._assign_signatures(self.signatures.reindex(pats))
 
@@ -407,8 +415,8 @@ class LARGeSSE_G(object) :
             correlation_p=self.correlation_p 
 
         if not patient_mask is None : 
-            omics=self.t_omics[patient_mask,:]
-            signatures=self.t_signatures[patient_mask,:]
+            omics=self.t_omics[patient_mask,:].to(self.device)
+            signatures=self.t_signatures[patient_mask,:].to(self.device)
         else : 
             omics=self.t_omics
             signatures=self.t_signatures
@@ -497,16 +505,17 @@ class LARGeSSE_G(object) :
         if nmo is None : 
             ih=ii.clone()
         else : 
-            nmo_indices_adj=(torch.tensor([[0,ii.shape[1]]],device=self.device)+nmo.indices().transpose(0,1)).transpose(0,1)
+            nmo_indices_adj=(torch.tensor([[0,ii.shape[1]]],device=CPU)+nmo.indices().transpose(0,1)).transpose(0,1)
             ih=torch.sparse_coo_tensor(
                 values=torch.cat((ii.values(),nmo.values()),axis=0),
                 indices=torch.cat((ii.indices(),nmo_indices_adj),axis=1),
                 size=(ii.shape[0],ii.shape[1]+nmo.shape[1]),
-                device=self.device #new
+                device=CPU,
             )
+        #FLAG : you may need to backtrack through here if running with resampling becomes very slow
 
         if weight : 
-            psty=torch.tensor(t_y+1,device=self.device).ravel()
+            psty=torch.tensor(t_y+1,device=CPU).ravel()
             sppsty=psty.to_sparse_coo()
             desppsty=sptops.diag_embed(sppsty)
 
@@ -524,8 +533,8 @@ class LARGeSSE_G(object) :
 
         IH=kwargs.get('IH',self.IH).coalesce()
         J=kwargs.get('J',self.J).coalesce()
-        timings=kwargs.get('timings',self.t_timings).clone().reshape(-1,1)
-        lengths=kwargs.get('lengths',self.t_lengths).clone().reshape(-1,1)
+        timings=kwargs.get('timings',self.t_timings).to(self.device).reshape(-1,1)
+        lengths=kwargs.get('lengths',self.t_lengths).to(self.device).reshape(-1,1)
 
         j_shift=IH.shape[1]
         length_shift=j_shift+J.shape[1]
@@ -536,7 +545,7 @@ class LARGeSSE_G(object) :
             indices=tnz,
             values=timings[tnz[0].ravel()].ravel(),
             size=timings.shape,
-            device=self.device #new
+            device=CPU
             ).coalesce()
 
         lnz=lengths.nonzero().transpose(0,1)
@@ -544,17 +553,17 @@ class LARGeSSE_G(object) :
             indices=lnz,
             values=lengths[lnz[0].ravel()].ravel(),
             size=lengths.shape,
-            device=self.device #new
+            device=CPU
             ).coalesce()
 
-        j_adj_indices=J.indices()+torch.tensor([[0],[j_shift]],device=self.device)
-        length_adj_indices=lv.indices()+torch.tensor([[0],[length_shift]],device=self.device)
-        timing_adj_indices=tv.indices()+torch.tensor([[0],[timing_shift]],device=self.device)
+        j_adj_indices=J.indices().cpu()+torch.tensor([[0],[j_shift]],device=CPU)
+        length_adj_indices=lv.indices()+torch.tensor([[0],[length_shift]],device=CPU)
+        timing_adj_indices=tv.indices()+torch.tensor([[0],[timing_shift]],device=CPU)
         #intercept_indices=torch.tensor(np.c_[np.zeros((IH.shape[0],),dtype=float),(1+timing_shift)*np.ones((IH.shape[0],),dtype=float)].transpose())
 
         X=torch.sparse_coo_tensor(
                 indices=torch.cat([IH.indices(),j_adj_indices,length_adj_indices,timing_adj_indices],axis=1),
-                values=torch.cat([IH.values(),J.values(),lv.values(),tv.values()],axis=0),
+                values=torch.cat([IH.values(),J.values().cpu(),lv.values(),tv.values()],axis=0),
                 size=(IH.shape[0],IH.shape[1]+J.shape[1]+2),
                 device=self.device #new
                 ).float()
@@ -566,14 +575,14 @@ class LARGeSSE_G(object) :
                 #).float()
 
         if normalize : 
-            xd=X.to_dense()
-            xdm=xd.max(axis=0).values
-            xdw=xd/xdm
-            xdw[ torch.isnan(xdw) ]=0
-            X=xdw.float()
-            #X[:,-1]=-1
-            X=X.to_sparse()
-            
+
+            xdm=X.to_dense().max(axis=0).values
+            xdmde=torch.sparse_coo_tensor(
+                    indices=np.c_[np.arange(len(xdm)),np.arange(len(xdm))].transpose(),
+                    values=xdm,
+                    size=(len(xdm),len(xdm))
+                    )
+            X=torch.mm(X,xdmde)
 
         if inplace: 
             self.X=X
@@ -774,8 +783,16 @@ class MultiPenaltyBinomialLoss(torch.nn.Module) :
         comb=torch.lgamma(n+1)-torch.lgamma(k+1)-torch.lgamma(n-k+1)
         indiv_ells=(log_output_probs*k + torch.log(1-output_probs)*(n-k))
         llterm=(comb+(indiv_ells)).sum()
+
+        if len(k.shape) == 1 : 
+            kshape=k.shape[0]
+        else : 
+            kshape=max(k.shape) 
         
-        penalty=sum([ s*(weights[m]).sum() for s,m in zip (self.strengths,self.masks) ])
+        penalty=sum([ np.exp(s.cpu().numpy())*kshape*weights[m].sum() for s,m in zip (self.strengths,self.masks) ])
+        #penalty=sum([ np.exp(s.cpu().numpy())*m.sum()*(weights[m]).sum() for s,m in zip (self.strengths,self.masks) ])
+        # why was this? fiting different numbers of event types causes the penalty to scale improperly
+        # len(weights) new as of 20240216
 
         return penalty-llterm
 
@@ -800,6 +817,8 @@ class OptimizerResult :
     lr  : float
     lbgfs_kwargs : dict
     convergence_status : bool
+    patient_indices_train :  typing.Optional[npt.NDArray[typing.Any]]  = None
+    patient_indices_test :  typing.Optional[npt.NDArray[typing.Any]]    = None
 
 @dataclass
 class AICResult: 
@@ -821,8 +840,7 @@ class Settings:
 
 #~~~~~~~~Initialization config~~~~~~~~~~
     hierarchy_path : str
-    tcga_directory : str
-    custom_omics : str
+    omics_path : str
     mutation_signature_path : str
     correlation_p : float
     j_regstrength : float
@@ -830,18 +848,19 @@ class Settings:
     hsystem_limit_upper : 2000
 
 #~~~~~~~~Burn-in config~~~~~~~~~~~~~~~~~
-    burn_max_iter : int =100
     burn_init_regstrength : int =10
     burn_max_epochs_per_run : int=2001
     burn_n_sampling_epochs_per_run : int=201
     burn_lr : float =5e-4
     burn_n_noh_runs : int = 10
-    burn_grad_floor : float =0.1
+    burn_grad_floor : float =0.005
     burn_convergence_timeout : int = 15
 #~~~~~~~~Main run config~~~~~~~~~~~~~~~~
     main_max_epochs : int = 4001
     main_n_sampling_epochs : int = 401
-    main_lr : float = 1e-4
+    main_lr : float = 2e-4
+#~~~~~~~~xval  config~~~~~~~~~~~~~~~~
+    n_xval_repeats : int = 10
 
 #~~~~~~~~Bootstrap config~~~~~~~~~~~~~~~
     n_boot_runs : int = 1000
@@ -853,6 +872,9 @@ class Settings:
 #~~~~~~~~Spoof config~~~~~~~~~~~~~~~
     n_spoofs : int = 20
     spoof_lr  : float = 1e-4
+
+#~~~~~~~~Legacy~~~~~~~~~~~~~~~~~~~~~
+    tcga_directory : str=''
     
 @dataclass
 class BurnInResult : 
@@ -927,8 +949,8 @@ class Logger(object) :
             npwlog=weights.cpu().detach().numpy()
             npilog=self.ilog.cpu().detach().numpy()
             
-            if self.out_sampling_epochs is None :
-                self.out_sampling_epochs =self.sampling_epochs
+        if self.out_sampling_epochs is None :
+            self.out_sampling_epochs =self.sampling_epochs
             
         return self.out_sampling_epochs,npllog,npwlog,npilog
 
@@ -959,7 +981,8 @@ def run_model(lg,
                    strengths,
                    masks,
                    global_feature_mask=None,
-                   patient_indices=None,
+                   patient_indices_train=None,
+                   patient_indices_test=None,
                    max_epochs=2001,
                    n_sampling_epochs=401,
                    lr=1e-2,
@@ -969,7 +992,7 @@ def run_model(lg,
                    recalc_J=False,
                    init_vals=None,
                    init_intercept=None,
-                   score_by_train=True
+                   savefile=None,
                   ) : 
 
     
@@ -988,23 +1011,16 @@ def run_model(lg,
     else : 
         tX=lg.X
 
+    if patient_indices_train is None :
+        patient_indices_train=lg._t_pat_indices
 
+    if patient_indices_test is None : 
+        patient_indices_test=patient_indices_train
 
-    if patient_indices is not None : 
-        outside_pat_indices=lg._t_pat_indices[ ~torch.isin(lg._t_pat_indices,patient_indices) ]
-        itx,iky=lg.build_xy_from_subset(gene_indices=None,patient_indices=patient_indices,recalc_J=recalc_J,renormalize_X=recalc_J)
-        ni=torch.tensor(len(patient_indices),device=DEVICE,dtype=torch.int)
-        if not score_by_train : 
-            otx,oky=lg.build_xy_from_subset(gene_indices=None,patient_indices=outside_pat_indices)
-            no=torch.tensor(len(outside_pat_indices),device=DEVICE,dtype=torch.int)
-    else : 
-        itx=tX
-        otx=tX
-        iky=torch.tensor(lg.y.values,device=DEVICE,dtype=torch.float)
-        ni=torch.tensor(lg.omics.shape[0],device=DEVICE,dtype=torch.int)
-        if not score_by_train : 
-            oky=torch.tensor(lg.y.values,device=DEVICE,dtype=torch.float)
-            no=torch.tensor(lg.omics.shape[0],device=DEVICE,dtype=torch.int)
+    ytr=lg.t_omics[patient_indices_train,:].sum(axis=0)
+    ntr=torch.tensor(len(patient_indices_train),device=lg.device)
+    yte=lg.t_omics[patient_indices_test,:].sum(axis=0)
+    nte=torch.tensor(len(patient_indices_test),device=lg.device)
 
     assert tX.shape[1] == init_vals.shape[0]
         
@@ -1020,16 +1036,14 @@ def run_model(lg,
             torch.nn.utils.clip_grad_norm_(model.parameters(),5)
             optimizer.zero_grad()
             yhat,weights=model(tX,return_weights=True)
-            loss=losser(yhat,iky,weights,ni)
+            loss=losser(yhat,ytr,weights,ntr)
             loss.backward()
             return loss
 
         optimizer.step(closure)
 
-        if score_by_train : 
-            if convergence_status := logger(epoch,tX,iky,ni) : break
-        else : 
-            if convergence_status := logger(epoch,tX,oky,no) : break
+        if convergence_status := logger(epoch,tX,yte,nte) : break
+
     else : 
         convergence_status=False
 
@@ -1044,10 +1058,139 @@ def run_model(lg,
             max_epochs=max_epochs,
             lr=lr,
             lbgfs_kwargs=lgbfs_kwargs,
-            convergence_status=convergence_status
+            convergence_status=convergence_status,
+            patient_indices_train=patient_indices_train,
+            patient_indices_test=patient_indices_test,
             )
+    if savefile : 
+        os.makedirs(os.path.split(savefile)[0],exist_ok=True)
+        torch.save(output,savefile)
 
     return output
+
+def optimize_regstrenth_itergridsearch(
+        lg,
+        globalmask,
+        masks,
+        strengths,
+        tweakwhichstrength,
+        nkfsplits=5,
+        lr=1e-3,
+        grad_floor=0.1,
+        max_epochs_per_run=2001,
+        n_sampling_epochs=201,
+        convergence_timeout=15,
+        fold_generator_seed='0xcade2ce',
+    ) : 
+    xnp=lg.X.cpu().to_dense().numpy()
+    sfxnp=xnp[:,globalmask]
+
+    init_rs=strengths[tweakwhichstrength]
+    lastcmean=np.inf
+
+    init_vals,init_intercept=lg.guess_weights()
+
+    criteria=np.zeros((nkfsplits,))
+
+
+    ofinterest=np.zeros((0,),dtype=np.int32)
+
+    starttime=time.time()
+    #kf=KFold(n_splits=nkfsplits)
+
+    fold_generator=np.random.Generator(np.random.MT19937(int(fold_generator_seed,16)))
+    folds_labels=fold_generator.choice(
+            a=np.cast['int'](np.arange(lg.omics.shape[0])),
+            size=lg.omics.shape[0],
+            replace=False,
+            )
+
+    nominal_best=strengths[tweakwhichstrength]
+    ltchunks=list()
+
+    for hme in range(4) :
+        loggertable=pd.DataFrame(
+                                columns=[
+                                      'metaepoch',
+                                      'fold',
+                                      'regstrength',
+                                      'criterion',
+                                      'elapsed',
+                                      'mean_vel',
+                                      'nparams',
+                                  ]
+                                )
+
+        range_amp=12/(2**hme)
+        mestrrange=np.linspace(nominal_best-range_amp,nominal_best+range_amp,7)
+
+        for metaepoch,strength_this_me in enumerate(mestrrange) : 
+            strengths[tweakwhichstrength]=strength_this_me
+            for e in range(5) : 
+                pitr=np.argwhere(folds_labels != e)
+                pite=np.argwhere(folds_labels == e)
+
+                optres=run_model(lg,
+                                 strengths=strengths,
+                                 global_feature_mask=globalmask,
+                                 masks=masks,
+                                 lr=lr,
+                                 max_epochs=max_epochs_per_run,
+                                 patient_indices_train=pitr,
+                                 #patient_indices_test=pival,
+                                 patient_indices_test=pite,
+                                )
+
+
+                ynp=lg.t_omics[torch.tensor(pite,device=lg.device),:].sum(axis=0).cpu().numpy()
+
+                aicres=aic_w(
+                               optres.weight[optres.loss.argmin(),:],
+                               optres.intercept[optres.loss.argmin()],
+                               sfxnp,
+                               ynp,
+                               len(pite)
+                          )
+
+                best_epoch_this=optres.loss.argmin()
+                best_weights_this=optres.weight[ best_epoch_this] 
+                eps=np.finfo(np.float32).eps
+
+                nparams=(best_weights_this> eps).sum()
+
+                ofinterest=np.union1d(ofinterest,np.argwhere(best_weights_this > eps).ravel())
+
+                last=pd.Series(dict(
+                                   metaepoch=hme*7+metaepoch,
+                                   fold=int(e),
+                                   regstrength=strengths[tweakwhichstrength],
+                                   criterion=aicres.criterion,
+                                   elapsed=int(time.time()-starttime//1.0),
+                                   nparams=nparams,
+                                   convergence_status=optres.convergence_status,
+                                   sumweights=best_weights_this.sum(),
+                                   lynp=max(ynp.shape),
+                                   effective_penalty=sum([ np.exp(s)*max(ynp.shape)*best_weights_this[m].sum() for s,m in zip(strengths,masks) ]),
+                               ))
+
+                last.name='{: >2}:{: >3}'.format(hme*7+metaepoch,e)
+                if loggertable.shape[0]  < 1: 
+                    loggertable=pd.DataFrame([last])
+                else: 
+                    loggertable=pd.concat([loggertable,pd.DataFrame([last])],axis=0) 
+
+                import __main__ as main
+                if hasattr(main,'__file__') : 
+                    print(loggertable.tail(1))
+                else: 
+                    display(loggertable.tail(10),clear=True)
+
+        ltchunks.append(loggertable.copy())
+        loggertable=postprocess_burnintable(loggertable[ loggertable.convergence_status ])
+                    
+        nominal_best=(-1*loggertable.dc*loggertable.regstrength).sum()/(-1*loggertable.dc).sum()
+
+    return pd.concat(ltchunks,axis=0),ofinterest 
 
 
 def optimize_regstrength_gradient(
@@ -1061,10 +1204,10 @@ def optimize_regstrength_gradient(
         grad_floor=0.1,
         max_epochs_per_run=2001,
         n_sampling_epochs=201,
-        convergence_timeout=15
+        convergence_timeout=15,
+        fold_generator_seed='0xcade2ce',
     ) : 
 
-    kf=KFold(n_splits=nkfsplits)
     xnp=lg.X.cpu().to_dense().numpy()
     sfxnp=xnp[:,globalmask]
 
@@ -1096,57 +1239,95 @@ def optimize_regstrength_gradient(
     starttime=time.time()
     dv=1
     lastfivedvs=np.ones((5,))
-    try : 
-        while not (metaepoch > 2 and np.abs(np.mean(lastfivedvs)) < grad_floor ) : 
-            for e,(itr,ite) in enumerate(kf.split(lg.omics.values)) : 
+    #kf=KFold(n_splits=nkfsplits)
 
-                patient_indices=torch.tensor(itr,device=DEVICE,dtype=torch.int)
+    fold_generator=np.random.Generator(np.random.MT19937(int(fold_generator_seed,16)))
+    folds_labels=fold_generator.choice(
+            a=np.cast['int'](np.arange(lg.omics.shape[0])),
+            size=lg.omics.shape[0],
+            replace=False,
+            )
+
+    try : 
+        while not (metaepoch > 3 and np.abs(np.mean(lastfivedvs)) < grad_floor ) : 
+            for e in range(5) :
+
+               #trval_indices=np.argwhere(folds_labels != e)
+               #trval_indices=fold_generator.choice(
+               #        a=trval_indices,
+               #        size=trval_indices.shape[0],
+               #        replace=False) #shuffle
+               #trvalcut=int(trval_indices.shape[0]*4//5)
+               #pitr=torch.tensor(trval_indices[:trvalcut],device=lg.device)
+               #pival=torch.tensor(trval_indices[trvalcut:],device=lg.device)
+               #pite=np.argwhere(folds_labels == e)
+
+                pitr=np.argwhere(folds_labels != e)
+                pite=np.argwhere(folds_labels == e)
 
                 optres=run_model(lg,
                                  strengths=strengths,
                                  global_feature_mask=globalmask,
                                  masks=masks,
-                                 patient_indices=patient_indices,
                                  lr=lr,
                                  max_epochs=max_epochs_per_run,
+                                 patient_indices_train=pitr,
+                                 #patient_indices_test=pival,
+                                 patient_indices_test=pite,
                                 )
 
 
-                ynp=lg.omics.values[ite,:].sum(axis=0)
+                ynp=lg.t_omics[torch.tensor(pite,device=lg.device),:].sum(axis=0).cpu().numpy()
 
-                aicres=aic_w(optres.weight[optres.loss.argmin(),:],
-                           optres.intercept[optres.loss.argmin()],
-                           sfxnp,
-                           ynp,
-                           len(ite)
+                aicres=aic_w(
+                               optres.weight[optres.loss.argmin(),:],
+                               optres.intercept[optres.loss.argmin()],
+                               sfxnp,
+                               ynp,
+                               len(pite)
                           )
 
-                if metaepoch == 0 : 
+                if metaepoch <= 1: 
                     grad=1
                 else : 
-                    dys=aicres.criterion - loggertable.query("fold == @e").criterion.values
-                    dxs=strengths[tweakwhichstrength] - loggertable.query("fold == @e").regstrength.values
-                    dyx=dys/dxs
-                    dyx[ np.isnan(dyx) | (dyx == 0)]=0
-                    weights=np.clip(np.abs(1/dxs/dxs),1e-7,1e2)
-                    weights[ np.isnan(weights) | (weights == 0) | np.isinf(weights) ]=0
-                    grad=(dyx*weights).sum()/weights.sum() 
+                   #dys=aicres.criterion - loggertable.query("fold == @e").criterion.values # overall improvement vs previous values
+                   #dxs=strengths[tweakwhichstrength] - loggertable.query("fold == @e").regstrength.values # said previous values
+                   #dyx=dys/dxs # slope
+                   #dyx[ np.isnan(dyx) | (dyx == 0)]=0 #zero out infinite slopes
+                   #weights=np.clip(np.abs(1/dxs/dxs),1e-7,1e2) # weights inverse of squared distance
+                   #weights[ np.isnan(weights) | (weights == 0) | np.isinf(weights) ]=0 # fix zeros in weights
+                   #grad=(dyx*weights).sum()/weights.sum()  #weighted gradient
+                    last_this_fold=loggertable.query("fold == @e").iloc[-1]
+
+                    drs=strengths[tweakwhichstrength] - last_this_fold.regstrength
+                    if (drs == 0) :
+                        grad=0
+                    else : 
+                        grad=(aicres.criterion - last_this_fold.criterion)/drs
+
                     assert not np.isnan(grad) and not np.isinf(grad) and not np.isinf(-1*grad)
-                    # this value will be positive if positive shifts increase criteria
-                    # this is the shift in AIC strength from a change in regularization strength of one
+                    # grad will be positive if positive shifts increase criteria
+                    # this is the shift in AIC strength from a change in regularization strength of +1
                     #  dv used to be grad/2
 
 
 
                 #factor=np.power(decel,metaepoch)
 
-                if metaepoch  > 0 : 
-                    dv = (dv-3*np.sin(np.arctan(grad)))/np.log(metaepoch+5)
+                if metaepoch  > 1 : 
+                    #dv = (dv-3*np.sin(np.arctan(grad)))/np.log(metaepoch+5)
+
+                    #if grad is negative, it means that increasing the regularization strength
+                    # decreases the criterion
+                    # in this case,  arctan(grad) will be negative (in radians)
+                    # and sin(grad) will also be negative
+                    #grad being negative means that positive shifts decrease criteria
+                    # so the shift should be opposite signed to grad
+
+                    dv = -1*np.arctan(grad/1e4)
                     assert not np.isnan(dv) and not np.isinf(dv) and not np.isinf(-1*dv)
                 else : 
-                    dv=0
-                    if e ==  ( nkfsplits -1 )  : 
-                        strengths[tweakwhichstrength] = init_rs *1.25
+                    dv=-2
 
                 best_epoch_this=optres.loss.argmin()
                 best_weights_this=optres.weight[ best_epoch_this] 
@@ -1161,10 +1342,15 @@ def optimize_regstrength_gradient(
                                    fold=int(e),
                                    regstrength=strengths[tweakwhichstrength],
                                    criterion=aicres.criterion,
+                                   grad=grad,
                                    dv=dv,
                                    elapsed=int(time.time()-starttime//1.0),
                                    mean_vel=np.mean(lastfivedvs),
                                    nparams=nparams,
+                                   convergence_status=optres.convergence_status,
+                                   sumweights=best_weights_this.sum(),
+                                   lynp=max(ynp.shape),
+                                   effective_penalty=sum([ np.exp(s)*max(ynp.shape)*best_weights_this[m].sum() for s,m in zip(strengths,masks) ]),
                                ))
 
                 last.name='{: >2}:{: >3}'.format(metaepoch,e)
@@ -1180,24 +1366,30 @@ def optimize_regstrength_gradient(
                     display(loggertable.tail(10),clear=True)
 
 
-                if metaepoch > 0 : 
+                if metaepoch > 1 or ( e == 4 ) : 
                     if aicres.k == 0 : 
-                        strengths[tweakwhichstrength] = abs(strengths[tweakwhichstrength])/5
+                        #strengths[tweakwhichstrength] = abs(strengths[tweakwhichstrength])/5
+                        strengths[tweakwhichstrength] = strengths[tweakwhichstrength] - 10
                     else : 
-                        strengths[tweakwhichstrength] = max([strengths[tweakwhichstrength] + dv ,abs(strengths[tweakwhichstrength])/2])
+                        strengths[tweakwhichstrength] = strengths[tweakwhichstrength] + dv 
 
-
-                    lastfivedvs[:-1]=lastfivedvs[1:]
-                    lastfivedvs[-1]=dv
+                elif metaepoch > 0  : 
+                    if aicres.k < globalmask.sum()/2 : 
+                        strengths[tweakwhichstrength] = strengths[tweakwhichstrength] - np.exp(-1)
+                    else: 
+                        strengths[tweakwhichstrength] = strengths[tweakwhichstrength] + np.exp(-1)
+                
+                lastfivedvs[:-1]=lastfivedvs[1:]
+                lastfivedvs[-1]=dv
 
             if metaepoch > convergence_timeout : break
             metaepoch += 1
 
         print('Done.')
     except KeyboardInterrupt : 
-        print(dys)
-        print(dxs)
-        print(dyx)
+        #print(dys)
+        #print(dxs)
+        #print(dyx)
         print(weights)
         print(grad)
         print(dv)
@@ -1205,9 +1397,19 @@ def optimize_regstrength_gradient(
 
     return loggertable,ofinterest
 
+def postprocess_burnintable(burnintable) :
 
+    burnintable=burnintable.assign(fold=pd.Categorical(burnintable.fold.astype(int),categories=np.unique(np.cast['int'](burnintable.fold.values))))
+    cfmax=burnintable.groupby('fold').criterion.max()
+    cfmin=burnintable.groupby('fold').criterion.min()
+    burnintable['cfmax']=cfmax.reindex(burnintable.fold).values
+    burnintable['cfmin']=cfmin.reindex(burnintable.fold).values
+    burnintable['cnorm']=(burnintable.criterion-burnintable.cfmin)/(burnintable.cfmax-burnintable.cfmin)
+    burnintable['dc']=(burnintable.criterion-burnintable.cfmax)
 
-def do_burn_in(lg,settings) : 
+    return burnintable
+
+def do_burn_in(lg,settings,savefile=None) : 
 
     j_regstrength=settings.j_regstrength
     regstrength=settings.burn_init_regstrength
@@ -1218,7 +1420,8 @@ def do_burn_in(lg,settings) :
     isasystem=(fts == 'system')
     notasystem=~isasystem
 
-    burnintable,ofinterest_nogenes=optimize_regstrength_gradient(
+    burnintable,ofinterest_nogenes=optimize_regstrenth_itergridsearch(
+    #burnintable,ofinterest_nogenes=optimize_regstrength_gradient(
                                         lg,
                                         globalmask=notagene,
                                         masks=(isasystem[notagene],(~isasystem)[notagene]),
@@ -1236,16 +1439,10 @@ def do_burn_in(lg,settings) :
     nogeneindex=full_feat_index[notagene]
     ofinterest_full=nogeneindex[ofinterest_nogenes]
 
-    burnintable=burnintable.assign(fold=pd.Categorical(burnintable.fold.astype(int),categories=np.unique(np.cast['int'](burnintable.fold.values))))
-    cfmax=burnintable.groupby('fold').criterion.max()
-    cfmin=burnintable.groupby('fold').criterion.min()
-    burnintable['cfmax']=cfmax.reindex(burnintable.fold).values
-    burnintable['cfmin']=cfmin.reindex(burnintable.fold).values
-    burnintable['cnorm']=(burnintable.criterion-burnintable.cfmin)/(burnintable.cfmax-burnintable.cfmin)
-    burnintable['dc']=(burnintable.criterion-burnintable.cfmax)
+    burnintable=postprocess_burnintable(burnintable)
 
     consensus_regstrength=(-1*burnintable.dc*burnintable.regstrength).sum()/(-1*burnintable.dc).sum()
-    ostrengths=[settings.j_regstrength,consensus_regstrength]
+    ostrengths=[consensus_regstrength,settings.j_regstrength]
     # You need to do another model run without the hierarchy but **with** genes in order to figure out which
     # could possibly matter.
 
@@ -1254,28 +1451,34 @@ def do_burn_in(lg,settings) :
     msg('Sampling no-hierarchy runs...')
     oi_genes=list()
     from tqdm.auto import tqdm
+
+    start_randseed=1337
+
     for x in tqdm(range(settings.burn_n_noh_runs),total=settings.burn_n_noh_runs) : 
-        patient_indices=lg.sample_patients(frac=0.8)
+
+        bnkwargs=compile_kwargs(lg,settings,which='burn_null',randseed=int(start_randseed*(x+1)))
+
         aux_optres=run_model(
                     lg,
                     strengths=ostrengths,
-                    masks=(isagene[notasystem],(~isagene)[notasystem]),
-                    global_feature_mask=notasystem,
-                    lr=settings.burn_lr,
-                    init_vals=initw[notasystem],
-                    init_intercept=initi,
-                    patient_indices=patient_indices,
+                    **bnkwargs,
                    )
+
         oi_genes.append(np.argwhere(aux_optres.weight[aux_optres.loss.argmin()] > 0 ).ravel())
 
     for x in range(settings.burn_n_noh_runs) : 
         oi_genes[x]=full_feat_index[notasystem][oi_genes[x]]
 
     ofinterest=reduce(np.union1d,[ofinterest_full]+oi_genes)
-                                    
-    return BurnInResult(frame=burnintable,
+
+    bir= BurnInResult(frame=burnintable,
                         ofinterest=ofinterest,
                         strengths=ostrengths)
+    if savefile : 
+        os.makedirs(os.path.split(savefile)[0],exist_ok=True)
+        torch.save(bir,savefile)
+                                    
+    return bir
 
 def do_bootstrapping(lg,
                      ofinterest,
@@ -1299,7 +1502,7 @@ def do_bootstrapping(lg,
                           strengths=strengths,
                           masks=[ isgeneorsystem[wasofinterest] , issig[wasofinterest]  ],
                           global_feature_mask=wasofinterest,
-                          patient_indices=patient_indices,
+                          patient_indices_train=patient_indices,
                           max_epochs=settings.boot_max_epochs,
                           n_sampling_epochs=settings.boot_n_sampling_epochs,
                           lr=settings.boot_lr,
@@ -1314,11 +1517,7 @@ def do_bootstrapping(lg,
 
 def assemble_lg(settings) : 
 
-    if not hasattr(settings,'custom_omics') or not settings.custom_omics is None : 
-        omics,msig=prep_guts(settings.tcga_directory,settings.mutation_signature_path)
-    else : 
-        msig=pd.read_csv(settings.mutation_signature_path,index_col=0) ;
-        omics=pd.read_csv(settings.custom_omics,index_col=0)
+    omics,msig=prep_guts(settings.omics_path,settings.mutation_signature_path)
 
     lengths,timings=load_protein_datas()
 
@@ -1335,83 +1534,156 @@ def assemble_lg(settings) :
 
     return lg
 
+def estimate_sigonly_regstrength(lg,settings,save=True) : 
+    fts=lg.featuretypes()
+    regstrength=settings.burn_init_regstrength
+
+    isasig=( fts != 'gene') & (fts != 'system')
+
+    burnintable_sigonly,ofinterest_sigonly=optimize_regstrenth_itergridsearch(
+                                        lg,
+                                        globalmask=isasig,
+                                        masks=(isasig[isasig],),
+                                        strengths=[settings.j_regstrength,],
+                                        tweakwhichstrength=0,
+                                        lr=settings.burn_lr,
+                                        grad_floor=settings.burn_grad_floor,
+                                        max_epochs_per_run=settings.burn_max_epochs_per_run,
+                                        n_sampling_epochs=settings.burn_n_sampling_epochs_per_run,
+                                        convergence_timeout=settings.burn_convergence_timeout,
+                                    )
+
+    burnintable_sigonly=postprocess_burnintable(burnintable_sigonly)
+
+    consensus_regstrength=(-1*burnintable_sigonly.dc*burnintable_sigonly.regstrength).sum()/(-1*burnintable_sigonly.dc).sum()
+
+    if save : 
+        burnintable_sigonly.to_csv(opj(settings.output_directory,'sigonly_burn_in.csv'))
+
+    return burnintable_sigonly
+
+
+def compile_kwargs(lg,settings,which='main',randseed='0xc0ffee') : 
+    if type(randseed) == str : 
+        randseed=int(randseed,16)
+
+    tg=torch.Generator(device=lg.device).manual_seed(randseed)
+
+    if which  in {'main','null','spoof'} : 
+        folds_labels=torch.multinomial(torch.tensor([4,1]).float().to(lg.device),lg.t_omics.shape[0],generator=tg,replacement=True)
+        itr=torch.argwhere(folds_labels == 0).ravel()
+        ite=torch.argwhere(folds_labels == 1).ravel()
+    elif which in {'burn_null'} : 
+        #folds_labels=torch.multinomial(torch.tensor([16,4,5]).to(lg.device),lg.t_omics.shape[0],generator=tg,replacement=True)
+        folds_labels=torch.multinomial(torch.tensor([16,4,5]).float().to(lg.device),lg.t_omics.shape[0],generator=tg,replacement=True)
+        itr=torch.argwhere(folds_labels == 0).ravel()
+        ite=torch.argwhere(folds_labels == 1).ravel()
+
+    fts=lg.featuretypes()
+    gene_mask= (fts == 'gene')
+    system_mask= (fts == 'system') 
+    sig_mask = ~gene_mask & ~system_mask
+    nonsig_mask =  gene_mask | system_mask
+
+    savefile=None
+
+    match which : 
+        case 'main' : 
+            global_feature_mask=np.cast['bool'](np.ones_like(nonsig_mask))
+            masks=[nonsig_mask,sig_mask]
+            savefile=opj(settings.output_directory,'main.pt')
+        case 'null' : 
+            global_feature_mask=~system_mask
+            masks=[nonsig_mask[~system_mask],sig_mask[~system_mask]]
+            savefile=opj(settings.output_directory,'matched_null.pt')
+        case 'burn_null' : 
+            global_feature_mask=~system_mask
+            masks=[nonsig_mask[~system_mask],sig_mask[~system_mask]]
+        case 'spoof' : 
+            global_feature_mask=np.cast['bool'](np.ones_like(nonsig_mask))
+            masks=[nonsig_mask,sig_mask]
+
+
+    return dict(
+                masks                   =   masks ,
+                global_feature_mask     =   global_feature_mask,
+                patient_indices_train   =   itr,
+                patient_indices_test    =   ite,
+                max_epochs              =   settings.main_max_epochs,
+                n_sampling_epochs       =   settings.main_n_sampling_epochs,
+                lr                      =   settings.main_lr,
+                savefile                =   savefile
+            )
+
+
 def main_script_process(settings): 
 
     lg=assemble_lg(settings) 
     # interpretation-- you are trying to find the signature regularization strengths
-    fts=lg.featuretypes()
-    if len(hier) < 1 : 
-        regstrength=settings.burn_init_regstrength
-
-        isasig=( fts != 'gene') & (fts != 'system')
-
-        burnintable_sigonly,ofinterest_sigonly=optimize_regstrength_gradient(
-                                            lg,
-                                            globalmask=isasig,
-                                            masks=(isasig[isasig],),
-                                            strengths=[regstrength,],
-                                            tweakwhichstrength=0,
-                                            lr=settings.burn_lr,
-                                            grad_floor=settings.burn_grad_floor,
-                                            max_epochs_per_run=settings.burn_max_epochs_per_run,
-                                            n_sampling_epochs=settings.burn_n_sampling_epochs_per_run,
-                                            convergence_timeout=settings.burn_convergence_timeout,
-                                        )
-
-        burnintable_sigonly=burnintable_sigonly.assign(fold=pd.Categorical(burnintable_sigonly.fold.astype(int),categories=np.unique(np.cast['int'](burnintable_sigonly.fold.values))))
-        cfmax=burnintable_sigonly.groupby('fold').criterion.max()
-        cfmin=burnintable_sigonly.groupby('fold').criterion.min()
-        burnintable_sigonly['cfmax']=cfmax.reindex(burnintable_sigonly.fold).values
-        burnintable_sigonly['cfmin']=cfmin.reindex(burnintable_sigonly.fold).values
-        burnintable_sigonly['cnorm']=(burnintable_sigonly.criterion-burnintable_sigonly.cfmin)/(burnintable_sigonly.cfmax-burnintable_sigonly.cfmin)
-        burnintable_sigonly['dc']=(burnintable_sigonly.criterion-burnintable_sigonly.cfmax)
-
-        consensus_regstrength=(-1*burnintable_sigonly.dc*burnintable_sigonly.regstrength).sum()/(-1*burnintable_sigonly.dc).sum()
-
-
-        burnintable_sigonly.to_csv('sigonly_burn_in.csv')
-
+    if len(lg.hierarchy) < 1 : 
+        estimate_sigonly_regstrength(lg,settings)  
     else : 
+        msg('Burn-in:')
+        bir=do_burn_in(lg,settings,)
 
+        msg('Running full main model...')
+        main_kws=compile_kwargs(lg,settings,which='main')
+        mainout=run_model(lg,strengths=bir.strengths,**main_kws) 
+        
+        msg('Running full matched null model...')
+        null_kws=compile_kwargs(lg,settings,which='null')
+        matchnullout=run_model(lg,strengths=bir.strengths,**null_kws)
+
+        msg('Running cross-validation...')
+        os.makedirs(opj(settings.output_directory,'xval'),exist_ok=True)
+
+
+        fts=lg.featuretypes()
         gene_mask= (fts == 'gene')
         system_mask= (fts == 'system') 
         sig_mask = ~gene_mask & ~system_mask
         nonsig_mask =  gene_mask | system_mask
 
-        msg('Burn-in:')
-        bir=do_burn_in(lg,settings)
-        torch.save(bir,opj(settings.output_directory,'burnin.pt'))
 
-        msg('Running main model...')
+        fold_generator=np.random.Generator(np.random.MT19937(int('0xc0ffee',16)))
+        for xvrepeat in range(settings.n_xval_repeats) : 
 
-        init_w,init_i=lg.guess_weights()
-        
-        mainout=run_model(lg,
-                            strengths=bir.strengths,
-                            masks=(nonsig_mask,sig_mask),
-                            lr=settings.main_lr,
-                            max_epochs=settings.main_max_epochs,
-                            init_vals=init_w,
-                            init_intercept=init_i,
+            folds_labels=fold_generator.choice(
+                                a=np.cast['int'](np.arange(lg.omics.shape[0]) // (lg.omics.shape[0]/5)),
+                                size=lg.omics.shape[0],
+                                replace=False
                             )
 
-        torch.save(mainout,opj(settings.output_directory,'main.pt'))
+            # if you use floor division **within** the denomiator term, you can give values fold labels of '5'
+            # if for some reason it is necessary that all folds are trained on the same number of patients
 
-        msg('Running matched null model...')
-        
-        matchnullout=run_model(lg,
-                            strengths=bir.strengths,
-                            masks=(nonsig_mask[~system_mask],sig_mask[~system_mask]),
-                            lr=settings.main_lr,
-                            max_epochs=settings.main_max_epochs,
-                            init_vals=init_w[~system_mask],
-                            init_intercept=init_i,
-                            global_feature_mask=(~system_mask),
-                            )
+            for fold in range(5) : 
 
-        torch.save(matchnullout,opj(settings.output_directory,'matched_null.pt'))
+                rflabel='rep{:0>3}fold{:0>3}'.format(xvrepeat,fold)
 
-        msg('Getting bootstrap values..')
+                pite=torch.tensor(np.argwhere(folds_labels == fold).ravel(),device=lg.device)
+
+                trval_indices=np.argwhere(folds_labels != fold).ravel()
+                trval_indices=fold_generator.choice(a=trval_indices,size=trval_indices.shape[0],replace=False)
+                trvalcut=int(trval_indices.shape[0]*4//5)
+                pitr=torch.tensor(trval_indices[:trvalcut],device=lg.device)
+                pival=torch.tensor(trval_indices[trvalcut:],device=lg.device)
+
+
+                optres_full=run_model(
+                                        lg,
+                                        strengths=bir.strengths,
+                                        masks=(nonsig_mask,sig_mask),
+                                        lr=settings.main_lr,
+                                        max_epochs=settings.main_max_epochs,
+                                        n_sampling_epochs=settings.main_n_sampling_epochs,
+                                        patient_indices_train=pitr,
+                                        patient_indices_test=pival,
+                                    )
+                torch.save((pitr,pival,pite),opj(settings.output_directory,'xval','splits_{:}.pt'.format(rflabel)))
+                torch.save(optres_full,opj(settings.output_directory,'xval','xval_full_{:}.pt'.format(rflabel)))
+
+        #msg('Getting bootstrap values..')
 
         full_feat_index=np.arange(lg.X.shape[1])
 
@@ -1421,22 +1693,21 @@ def main_script_process(settings):
                  full_feat_index[np.argwhere(matchnullout.weight[matchnullout.loss.argmin()] > 0).ravel()],
                  ])
 
-        bootout=do_bootstrapping(lg,ofinterest,bir.strengths,settings)
+        #bootout=do_bootstrapping(lg,ofinterest,bir.strengths,settings)
+        #torch.save(bootout,opj(settings.output_directory,'boot.pt'))
 
-        torch.save(bootout,opj(settings.output_directory,'boot.pt'))
-
-        msg('Saving most matrices...')
-        if settings.save_tmps :
-            tocollect=sorted([ kg.opj(settings.tmpprefix,fp) for fp in os.listdir(settings.tmpprefix) 
-                                if fp.startswith(settings.jobprefix+'_boot') and fp.endswith('.pt')])
-            tmps=list()
-            for tc in tocollect : 
-                tmps.append(torch.load(tc))
-            torch.save(tmps,opj(settings.output_directory,'boot_individuals.pt'))
+        #msg('Saving most matrices...')
+        #if settings.save_tmps :
+        #    tocollect=sorted([ kg.opj(settings.tmpprefix,fp) for fp in os.listdir(settings.tmpprefix) 
+        #                        if fp.startswith(settings.jobprefix+'_boot') and fp.endswith('.pt')])
+        #    tmps=list()
+        #    for tc in tocollect : 
+        #        tmps.append(torch.load(tc))
+        #    torch.save(tmps,opj(settings.output_directory,'boot_individuals.pt'))
 
         torch.save(settings,opj(settings.output_directory,'settings.pt'))
 
-        torch.save(X.cpu(),opj(settings.output_directory,'X.pt'))
+        torch.save(lg.X.cpu(),opj(settings.output_directory,'X.pt'))
 
         np.savez(
             opj(settings.output_directory,'arrays.npz'),
@@ -1453,27 +1724,30 @@ def main_script_process(settings):
         waitbar.display()
         for pref,tf in zip(['fake','wild'],[True,False]) : 
             for x in range(settings.n_spoofs) : 
+                torch.cuda.empty_cache()
                 thisspdir=opj(settings.output_directory,pref+'_'+str(x))
                 os.makedirs(thisspdir,exist_ok=True)
                 sh=spoof(lg.hierarchy,preserve_rowsums=True)
-                lgspoof=LARGeSSE_G(omics=omics,signatures=msig,lengths=lengths,timings=timings)
+                lgspoof=LARGeSSE_G(omics=lg.omics,signatures=lg.signatures,lengths=lg.lengths,timings=lg.timings)
                 lgspoof._assign_hierarchy(sh,system_limit_upper=settings.hsystem_limit_upper,system_limit_lower=settings.hsystem_limit_lower)
                 sp_IH=lgspoof.build_IH(inplace=True,weight=False)
                 sp_J=lgspoof.build_J(inplace=True,correlation_p=settings.correlation_p)
                 X=lgspoof.build_X(normalize=True,inplace=True)
                 
-                spooffeaturetypes=lgspoof.featuretypes()
-                spoofsigmask=( spooffeaturetypes != 'gene')  & ( spooffeaturetypes != 'system')
+                spoof_kws=compile_kwargs(lgspoof,settings,which='spoof')
+                spoof_kws.update(dict(savefile=opj(thisspdir,'logger.pt')))
+                torch.save(X,opj(thisspdir,'spX.pt'))
+                #spooffeaturetypes=lgspoof.featuretypes()
+                #spoofsigmask=( spooffeaturetypes != 'gene')  & ( spooffeaturetypes != 'system')
                 
+                #RESUME -- fix this, add a spoof setting, whatever, so that it doesn't overwrite main
+                # then, do a final prep run before deploying in batch
                 splog=run_model(
                                 lgspoof,
                                 strengths=bir.strengths,
-                                masks=(~spoofsigmask,spoofsigmask),
-                                lr=settings.spoof_lr,
+                                **spoof_kws,
                                 )
                 
-                torch.save(X,opj(thisspdir,'spX.pt'))
-                torch.save(splog,opj(thisspdir,'logger.pt'))
                 waitbar.update()
         waitbar.close()
 
@@ -1487,3 +1761,19 @@ if __name__ == '__main__' :
         main_script_process(settings) ; 
     else : 
         pass
+
+#   if patient_indicesis not None : 
+#       outside_pat_indices=lg._t_pat_indices[ ~torch.isin(lg._t_pat_indices,patient_indices) ]
+#       itx,iky=lg.build_xy_from_subset(gene_indices=None,patient_indices=patient_indices,recalc_J=recalc_J,renormalize_X=recalc_J)
+#       ni=torch.tensor(len(patient_indices),device=DEVICE,dtype=torch.int)
+#       if not score_by_train : 
+#           otx,oky=lg.build_xy_from_subset(gene_indices=None,patient_indices=outside_pat_indices)
+#           no=torch.tensor(len(outside_pat_indices),device=DEVICE,dtype=torch.int)
+#   else : 
+#       itx=tX
+#       otx=tX
+#       iky=torch.tensor(lg.y.values,device=DEVICE,dtype=torch.float)
+#       ni=torch.tensor(lg.omics.shape[0],device=DEVICE,dtype=torch.int)
+#       if not score_by_train : 
+#           oky=torch.tensor(lg.y.values,device=DEVICE,dtype=torch.float)
+#           no=torch.tensor(lg.omics.shape[0],device=DEVICE,dtype=torch.int)

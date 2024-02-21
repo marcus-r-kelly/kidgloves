@@ -6,46 +6,14 @@ from SigProfilerAssignment import Analyzer as Analyze
 import numpy as np
 import multiprocessing as mp
 
-#p_cbio='/cellar/users/mrkelly/Data/canon/cbioportal'
-#p_raw='/cellar/users/mrkelly/Data/canon/tcga_segment'
+
+
+
 p_hg19='/cellar/users/mrkelly/Data/canon/ncbi_reference/hg_19_blastdb_too_official/GRCh37_chrless.fna'
 p_hg38='/cellar/users/mrkelly/Data/canon/ncbi_reference/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna'
 gdc_path='/cellar/users/mrkelly/Data/canon/gdc_direct/'
 
 cwd=os.getcwd()
-   #cohorts=[ 'blca', 'brca', 'cesc', 'coadread', 'esca', 'gbm',
-   #'hnsc', 'kirc', 'kirp', 'laml', 'lgg', 'lihc', 'luad', 'lusc',
-   #'ov', 'paad', 'prad', 'sarc', 'skcm', 'stad',
-   #'thca', 'thym', 'ucec']
-
-def get_aliquot_id_from_file(fp) : 
-    with open(fp,'r') as thefile:
-        thefile.readline()
-        return (thefile.readline().strip().split('\t')[0],fp)
-
-   #def do_mutations_from_cbioportal() :
-   #    print('Working on mutations for',c)
-   #    #~~~~vcfs from maf files~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-   #    if (not 'cohort_'+c in os.listdir('.')): os.mkdir('cohort_'+c)
-
-   #    processed_muts_file_name='temporary/'+c+'.txt'
-
-   #    muts_raw=pd.read_csv(os.path.join(p_cbio,c+'_tcga_pan_can_atlas_2018','data_mutations.txt'),sep='\t')
-   #    if 'Annotation_Status' not in muts_raw.columns : 
-   #        muts_raw.query('Verification_Status == "Verified"').to_csv(processed_muts_file_name,index=False,sep='\t')
-   #    else : 
-   #        muts_raw.query('Annotation_Status == "SUCCESS"').to_csv(processed_muts_file_name,index=False,sep='\t')
-
-   #    this_maf_path=os.path.join(thispath,'mafs')
-   #    if not os.path.exists(this_maf_path) :  os.mkdir(this_maf_path)
-
-   #    run(['perl','/cellar/users/mrkelly/Data/canon/vcf2maf/mskcc-vcf2maf-754d68a/maf2vcf.pl',
-   #        '--input-maf',processed_muts_file_name,'--ref-fasta',p_hg19,'--output-dir',
-   #        os.path.join(thispath,'mafs'),'--per-tn-vcfs'])
-
-   #    print('Mutation organizing done.')
-
-   #    return
 def read_maf(maf_path) : 
     return pd.read_csv(maf_path,comment='#',header=0,sep='\t')
 
@@ -115,13 +83,21 @@ def do_segments(c,gdc_path) :
 
     return
 
-if __name__ == '__main__' and len(sys.argv) > 0 : 
-    c=sys.argv[1]
-    try : 
-        gdc_path=sys.argv[2]
-    except : 
-        pass
-#c='thym'
+if __name__ == '__main__' and len(sys.argv) > 1 : 
+    import argparse
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--gdc_root_folder',
+            action='store',
+            help="Folder containing GDC datas, assumed to be in their own subfolders as from a `gdc-client` download.",
+            )
+    parser.add_argument('--gdc_sample_sheet',
+            action='store',
+            help="Sample sheet, downloaded concurrently with GDC items, describing which each is and which patient they correspond to",
+            )
+    ns=parser.parse_args()
+
+    gdc_root_folder=ns.gdc_root_folder
+    gdc_sample_sheet=ns.gdc_sample_sheet
 
     pr1=mp.Process(target=do_mutations_from_gdc,args=(c,gdc_path))
     pr2=mp.Process(target=do_segments,args=(c,gdc_path))

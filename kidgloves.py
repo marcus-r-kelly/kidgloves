@@ -24,6 +24,7 @@ import warnings
 import yaml
 import multiprocessing as mp
 from scipy.sparse import csc_matrix
+from functools import reduce,partial
 
 import hier
 N_PCS=3
@@ -45,144 +46,31 @@ def msg(*args,**kwargs) :
     sys.stdout.flush() ;
 
 
-#~~~~~~~~Input reader functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#~~~~~~~~Omics data reader functions are now in cohort_preprocessing~~~~~~~~~~~~
+@np.vectorize
+def get_ensembl_xref(dbxrefs) : 
+    for xref in dbxrefs.split('|') : 
+        subfields=xref.split(':')
+        if subfields[0] == 'Ensembl' : 
+            return subfields[1]  
+    else :
+        return None
+@np.vectorize
+def trim_ensembl_version(ensembl) :
+    return ensembl.split('.')[0]
 
-#TODO : alter this so that it can read a folder tree's worth of MAF files
+@np.vectorize
+def trim_gz(filename) : 
+    if filename.endswith('.gz'): 
+        return '.'.join(filename.split('.')[:-1])
+    return filename
 
-def _fix_overlong_tcga(tcga) : 
-    return '-'.join(tcga.split('-')[:3])
-
-def read_mutation_file(fn,drop_null_eids=True) : 
-    """ Load mutation file (TCGA via cbioportal) """
-    with warnings.catch_warnings() :
-        warnings.simplefilter('ignore')
-        muts=pd.read_csv(fn,sep='\t')
-        if drop_null_eids :  
-            muts.dropna(subset=['Entrez_Gene_Id'],inplace=True)
-        else : 
-            muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].replace(np.nan,0)
-
-        muts['Entrez_Gene_Id']=muts['Entrez_Gene_Id'].astype(int).astype(str)
-        muts['Tumor_Sample_Barcode']=np.vectorize(_fix_overlong_tcga)(muts.Tumor_Sample_Barcode)
-        return muts
-
-def read_cna_file(fn) : 
-    """ Load CNA file (TCGA via cbioportal) """
-    with warnings.catch_warnings() :
-        warnings.simplefilter('ignore')
-        cnas=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean(numeric_only=True)
-        cnas=cnas.reindex(cnas.index.dropna())
-        cnas.index=cnas.index.astype(int).astype(str)
-        cnas.columns.name='sample'
-        cnas.index.name='Entrez_Gene_Id'
-        cnas.columns=np.vectorize(_fix_overlong_tcga)(cnas.columns)
-        return cnas.transpose()
-
-def read_rna_file(fn) : 
-    """ Load HiSeqV2 file and normalize (TCGA via cbioportal) """
-    with warnings.catch_warnings() :
-        warnings.simplefilter('ignore')
-        hiseq=pd.read_csv(fn,sep='\t').groupby('Entrez_Gene_Id').mean(numeric_only=True)
-        hiseq=hiseq.reindex(hiseq.index.dropna())
-        hiseq.index=hiseq.index.astype(int).astype(str)
-        hiseq.index.name='Entrez_Gene_Id'
-        hiseq.columns.name='sample'
-        #hiseq=hiseq.drop(columns=['Hugo_Symbol'])
-        from sklearn.preprocessing import StandardScaler
-        hiseq=hiseq.reset_index().groupby('Entrez_Gene_Id').mean(numeric_only=True)
-        hsss=pd.DataFrame(data=StandardScaler().fit_transform(hiseq.transpose()),index=hiseq.columns,columns=hiseq.index)
-        hsss.index=np.vectorize(_fix_overlong_tcga)(hsss.index)
-        return hsss
-
-def read_fusion_file(fn) : 
-    """ Load gene fusion calls (TCGA via cbioportal) """
-    with warnings.catch_warnings() :
-        warnings.simplefilter('ignore')
-        fus=pd.read_csv(fn,sep='\t',index_col=False)
-        pats=fus.Sample_Id.unique()
-        patindices=dict(zip(pats,range(len(pats))))
-        syms=np.union1d(fus.Site1_Hugo_Symbol.unique(),fus.Site2_Hugo_Symbol.unique())
-        symindices=dict(zip(syms,range(len(syms))))
-
-        if _s2e is None : _get_geneinfo()
-
-        eids=np.array([ _s2e.get(s,'0') for s in syms ])
-
-        fgrid=np.zeros(shape=(len(pats),len(syms)),dtype=np.uint32)
-        for x,r in fus.iterrows() :
-            pi=patindices[r.Sample_Id]
-            si1=symindices[r.Site1_Hugo_Symbol]
-            si2=symindices[r.Site2_Hugo_Symbol]
-            fgrid[pi,si1]=1
-            fgrid[pi,si2]=1
-
-        dffus=pd.DataFrame(index=pats,columns=eids,data=fgrid).drop(columns=['0'])
-        dffus.index=np.vectorize(_fix_overlong_tcga)(dffus.index)
-            
-        return dffus
-
-def autoload(tcga_directory,gene_set=None,mutations_from=None): 
-    if mutations_from is None : 
-        muts=read_mutation_file(os.path.join(tcga_directory,'data_mutations.txt'))
-    else : 
-        muts=read_mutation_file(mutations_from)
-    #mpiv=pivot_mutation_events(muts).rename(columns=lambda x : x+'_mut').drop(columns=['0_mut'])
-    cnas=read_cna_file(os.path.join(tcga_directory,'data_log2_cna.txt'))
-    #rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_normal_samples.txt'))
-    #rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_diploid_samples.txt'))
-    rnas=read_rna_file(os.path.join(tcga_directory,'data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt')) # changed back 12/7/2023
-    fus=read_fusion_file(os.path.join(tcga_directory,'data_sv.txt'))
-    if not gene_set : 
-        omics=sync_omics(muts,cnas,rnas,fus,logic='intersection',gene_set=gene_set)
-    else : 
-        omics=sync_omics(muts,cnas,rnas,fus,logic='force',gene_set=gene_set)
-
-    return omics
-
-def autoload_events(tcga_directory,gene_set=None,heuristic=3,n2keep=2,mutations_from=None) : 
-    omics=autoload(tcga_directory,gene_set=gene_set,mutations_from=mutations_from)
-    mpiv=pivot_mutation_events(omics['muts']).rename(columns=lambda x : x+'_mut')
-
-    ups=define_lesionclass(
-            [
-                omics['rna'],
-                omics['cnas'],
-            ],
-            [
-                lambda x : x > 1.6 , # formerly both 1.6
-                lambda x : x > 1.6 ,
-            ],'up',min_events_to_keep=n2keep)
-
-    dns=define_lesionclass(
-            [
-                omics['rna'],
-                omics['cnas'],
-            ],
-            [
-                lambda x : x < -0.75 , # formerly both 1.6, this is after inspection of CDK2NA in lung cancer
-                lambda x : x < -0.75 ,
-            ],'dn',min_events_to_keep=n2keep)
-
-    fus=define_lesionclass(
-        [ omics['fus'],],
-        [ lambda x : x > 0,],
-        'fus',
-        min_events_to_keep=1)
-
-    td=pd.concat([mpiv,ups,dns,fus],axis=1).fillna(0).astype(int)
-
-    # the heuristic is only invoked if there are 3 times as many features as patients
-    if heuristic and td.shape[1] >= heuristic*td.shape[0]:  
-        omic_incidence=td.sum().sort_values(ascending=False)
-        omicfloor=omic_incidence.iloc[heuristic*td.shape[0]]
-        # the heuristic sets a floor at the event count the 3xn ranked event
-        # all events with that many or greater counts are taken
-        print('Omic floor set at',omicfloor)
-        td=td[ td.columns[td.sum().ge(omicfloor)]]
     
-    return td
+@np.vectorize(otypes=[str])
+def fix_tsb(tsb) : 
+    return '-'.join(tsb.split('-')[:3])
 
-
+#~~~~~~~~Tree reader functions~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def extract_nest_systems(nestdf) :
     """ creates an annotation: {gene,} dict from nest table """
     return { r['shared name'] : set(r.genes.split(' ')) - {'',}
@@ -225,114 +113,7 @@ def arrayify_nest_mask(nest_mask,event_order,tensorize=True) :
     else : return nma
     
 
-   ##tf
-   ##return tf.convert_to_tensor([
-   #        #[ int(e in nest_mask[s]) for s in systems ]
-   #        #for e in events ])
-   #return torch.tensor([
-   #        [ np.int32(e in nest_mask[s]) for s in systems ]
-   #        for e in events ])
-
-#~~~~~~~~transitioning from input data to lesionclasses and burdens~~~~~~~~~~~~~
-
-def sync_omics(muts,cnas,rna,fus,gene_set=None,patients=None,logic='union') :
-    """ return datasets such that all refer to the same genes and patients.
-        if gene_set or patients not provided, use the largest set represented
-        in all 3 datasets.
-
-        muts, cnas, rna refer to the outputs of read_mutation_file,
-        read_cna_file, and read_hiseq_file respectively.
-
-        the mutations are *not* pivoted first
-    """
-    
-    theop={'union' : np.union1d ,'intersection' : np.intersect1d ,
-           'force' : 'force' }.get(logic.lower())
-    
-    from functools import reduce
-    if theop == 'force' : 
-        if gene_set is None : 
-            raise valueerror('if logic is "force", then a gene_set must be provided')
-        pass ;
-    elif gene_set is None: 
-        gene_set=reduce(theop,[np.unique(muts['Entrez_Gene_Id']),cnas.columns,rna.columns])
-        #resume
-    else: 
-        inargeneset=gene_set
-        gene_set=reduce(theop,[gene_set,np.unique(muts['Entrez_Gene_Id']),cnas.columns,rna.columns])
-        #import sys
-        #print('the following items in gene_set were not found:\n',
-              #np.setdiff1d(inargeneset,gene_set),file=sys.stderr)
-        
-    if patients is None : 
-        
-        patients=reduce(np.intersect1d,[np.unique(muts['Tumor_Sample_Barcode']),cnas.index,rna.index])
-        print(len(patients),'patients')
-        
-    mutsout=muts.query('Tumor_Sample_Barcode in @patients and Entrez_Gene_Id in @gene_set')
-    #attention to these lines--- can cause dropping of some dozens of patients
-    with warnings.catch_warnings() :
-        warnings.simplefilter("error")
-
-        patients=np.intersect1d(patients,mutsout['Tumor_Sample_Barcode'].unique())
-        cnasout=cnas.reindex(index=patients,columns=gene_set).fillna(0)
-        rnaout=rna.reindex(index=patients,columns=gene_set).fillna(0)
-        fusout=fus.reindex(index=patients,columns=gene_set).fillna(0)
-    
-    return dict(zip(['muts','cnas','rna','fus'],[mutsout,cnasout,rnaout,fusout]))
-
-def _default_mutation_filter(r) : 
-    """
-    test whether series from mutation file refers to amino acid change
-    """
-    return ( not pd.isnull(r.HGVSp) ) and ( not '=' in r.HGVSp )
-
-def pivot_mutation_events(muts,f=_default_mutation_filter,min_events_to_keep=1) :
-    """
-    return a binarized pivot table from mutation DataFrame,
-    filtering first using function f. if f is None, do not filter
-    """
-
-    if not f :
-        _muts=pd.DataFrame(muts)
-    else: 
-        _muts=pd.DataFrame(muts[ muts.apply(f,axis=1) ])
-        
-    _muts['theval']=1
-        
-    _muts=_muts.drop_duplicates(subset=['Entrez_Gene_Id','Tumor_Sample_Barcode'],keep='first')\
-            .pivot(index='Tumor_Sample_Barcode',columns='Entrez_Gene_Id',values='theval').fillna(0)
-
-    _muts.index.name='sample'
-    _muts.columns.name='gene_id'
-    _muts.columns=_muts.columns.astype(str)
-
-    totals=_muts.sum()
-    _muts=_muts[ totals[ totals >= min_events_to_keep ].index ]
-
-    return _muts.reindex(index=muts['Tumor_Sample_Barcode'].unique()).fillna(0)
-    
-def define_lesionclass(frames,filters,suffix,logic='and',min_events_to_keep=1) : 
-    """
-    define lesionclasses by applying filter functions to *pivoted* DataFrames
-    and returning a boolean DataFrame defined by the given logical relationship
-    between all filtered frames.
-    """ 
-    
-    assert len(frames)==len(filters)
-    assert logic.upper() in {'AND','OR'}
-    
-    ma=filters[0](frames[0])
-    for i in range(1,len(filters)) : 
-        if logic.upper() == 'AND' : 
-            ma=ma & filters[i](frames[i])
-        elif logic.upper() == 'OR' : 
-            ma=ma | filters[i](frames[i])
-                   
-    ma=ma.rename(columns= lambda s : str(s)+'_'+suffix)
-    if min_events_to_keep :
-        ma=ma.loc[:,ma.sum(axis=0).gt(min_events_to_keep)]
-    return ma
+#~~~~~~~~Things actually about mutational epistasis~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def get_coincident_observation_names(singlet_names) :
     """
@@ -568,6 +349,20 @@ geneinfopath=os.sep.join([os.getenv('HOME'),'Data','canon','ncbi_reference','Hom
 _gi=None
 _s2e=None
 _e2s=None
+_ens2e=None
+_e2ens=None
+
+BADGENES=None
+
+@np.vectorize
+def get_ensembl_xref(dbxrefs) : 
+    for xref in dbxrefs.split('|') : 
+        subfields=xref.split(':')
+        if subfields[0] == 'Ensembl' : 
+            return subfields[1]  
+    else :
+        return None
+
 def _get_geneinfo() : 
     """
     generate event pairs for logit field analysis, excluding those where 
@@ -576,10 +371,26 @@ def _get_geneinfo() :
     global _gi 
     global _s2e
     global _e2s
+    global BADGENES
 
-    _gi=pd.read_csv(geneinfopath,sep='\t')
-    _s2e=dict(zip(_gi.Symbol.values,_gi.GeneID.astype(int).astype(str).values))
-    _e2s=dict(zip(_gi.GeneID.astype(int).astype(str).values,_gi.Symbol.values))#BOLO: can this be dropped?
+    _gi=pd.read_csv(geneinfopath,sep='\t')[::-1] 
+    _gi['Ensembl']=get_ensembl_xref(_gi.dbXrefs)
+    _gi['GeneID']=_gi.GeneID.astype(str)
+    # [::-1] this means that for items iterating through, "older"/more canonical entries will be last and supersede shakier ones
+
+
+    _e2s=dict()
+    _s2e=dict()
+    _ens2e=dict()
+    _e2ens=dict()
+    for r in _gi.itertuples() :
+        _e2s.update({ r.GeneID : r.Symbol })
+        _e2ens.update({ r.GeneID : r.Ensembl})
+        _ens2e.update({ r.Ensembl : r.GeneID})
+        _s2e.update({ r.Symbol : r.GeneID })
+
+    bad_gene_categories={'other','pseudo','biological-region','unknown'}
+    BADGENES=set(list(_gi.query("type_of_gene in @bad_gene_categories or (type_of_gene == 'ncRNA' and Ensembl == 'None')").GeneID.unique()))
 
 def annotate_map_locations(raw_model_stats_df) :
     """
