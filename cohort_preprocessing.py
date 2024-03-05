@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 import multiprocessing as mp
 from functools import partial,reduce
 from itertools import product
+import multiprocessing as mp
 
 
 # What workflows is this module/script trying to cover?
@@ -21,6 +22,7 @@ _e2s=None
 _ens2e=None
 _e2ens=None
 BADGENES=None
+_gff=None
 geneinfopath='/cellar/users/mrkelly/Data/canon/ncbi_reference/Homo_sapiens.gene_info'
 
 def msg(*args,**kwargs) : 
@@ -111,7 +113,135 @@ def read_cna(path) :
     return ser.dropna()
 
 import time
-def process_cna_group(cnapaths,sampsheet) : 
+
+def get_neighbor_wavg(gser,chrslc,mfbchunk) :
+    gffser_this_gene=gser
+    thisgene=gser.name
+    chromo=gffser_this_gene.Chr
+    start=gffser_this_gene.start
+    wt=1/np.log(np.abs(chrslc.start-start)+1)
+    rel_amt=mfbchunk[thisgene]/((mfbchunk[wt.index]*wt).sum(axis=1)/wt.sum())
+    rel_amt.name=thisgene
+    return rel_amt
+
+def gnwhandler(t) : 
+    chromoslc,mfbchunk=t
+    return [ get_neighbor_wavg(chromoslc.loc[g],chromoslc.drop(index=g),mfbchunk) for g in mfbchunk.columns ]
+
+def process_cna_group(cnapaths,sampsheet,return_extra=False) : 
+
+    start=time.time()
+
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Reading cna files...')
+    with mp.Pool(processes=int(3*len(os.sched_getaffinity(0))//4)) as p : 
+        cserieses=[ x for x in p.imap(read_cna,cnapaths) ]
+    protoc=pd.DataFrame(cserieses).reset_index()
+
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Handling protoc keys...')
+    protoc=protoc.rename(columns={ 'index' : 'File Name' })
+    protoc['File Name']=np.vectorize(lambda p : p.split('/')[-1])(protoc['File Name'])
+    protoc=protoc.sort_values('File Name')
+
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Merging into meta...')
+    subss=sampsheet[['File Name','simple_case_id']].sort_values('File Name')
+    urmerc=protoc.merge(subss,on='File Name',how='left').drop(columns=['File Name'])
+    merc=urmerc.groupby('simple_case_id').mean()
+    mcc0=np.array(merc.columns)
+
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Reading genomic annotations...')
+    gffgu=_prep_gff_for_cna(subset=mcc0)
+
+
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Figuring out chromosome situation...')
+
+    _get_geneinfo()
+
+    gi=_gi.query('GeneID in @mcc0')
+
+    # RESUME
+    uchrs=[ cu for cu in gi.chromosome.unique() if not ('-' in cu  or '|' in cu or 'U' in cu)]
+    gi=gi.query('chromosome in @uchrs')
+
+    gene2chromo={ r.GeneID : r.chromosome for r in gi.itertuples() if r.chromosome in uchrs }
+    chrgened=dict(zip(uchrs,[ gi.query('chromosome == @uchr').GeneID.unique() for uchr in uchrs ]))
+
+    gffgu['Chr']=np.vectorize(gene2chromo.get)(gffgu.index)
+    gffgu=gffgu.dropna(subset='Chr')
+
+    mcc=np.intersect1d(gffgu.index,np.intersect1d(mcc0,gi.GeneID))
+
+    chrgened={ k : np.intersect1d(mcc,v) for k,v in chrgened.items() }
+
+    merc=merc[mcc]
+    gffgu=gffgu.reindex(mcc)
+    gi=gi.query('GeneID in @mcc')
+
+    ygenes=chrgened['Y']
+    xgenes=chrgened['X']
+
+    y0counts=(merc[ygenes].isnull() | (merc[ygenes] == 0 )).sum(axis=1)
+    females=y0counts[ y0counts > 10].index
+    males=np.setdiff1d(merc.index,females)
+
+    dfbasal=pd.DataFrame(index=merc.index,columns=merc.columns,data=2*np.ones_like(merc.values))
+    dfbasal.loc[males,xgenes]=1
+    dfbasal.loc[males,ygenes]=1
+    dfbasal.loc[females,ygenes]=0
+
+    mfb=merc.fillna(dfbasal)
+
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Calculating focality...')
+    jobs=[ (gffgu.query('Chr == @uchr'),mfb[chrgened[uchr]]) for uchr in uchrs ]
+
+    with mp.Pool(processes=24) as p : 
+        allseries=[ x for x in p.imap_unordered(gnwhandler,jobs)]
+
+    dfwavg=pd.concat([ x for serser in allseries for x in serser ],axis=1)
+    dfwavg=pd.DataFrame(data=np.clip(dfwavg.values,0,100),index=dfwavg.index,columns=dfwavg.columns)
+    dfwavg=dfwavg[ dfwavg.columns[~dfwavg.isnull().all(axis=0)] ].fillna(0) 
+
+    focality=np.log(dfwavg.mean())/np.log(2)
+    msg('{: >10.2f}'.format(time.time()-start))
+    msg('Defining events...')
+    jobs=[ (gffgu.query('Chr == @uchr'),mfb[chrgened[uchr]]) for uchr in uchrs ]
+
+    medfocality=np.median(focality)
+    madfocality=np.median(np.abs(focality-medfocality))
+    zfocality=(focality-medfocality)/madfocality
+
+    delta=(merc-dfbasal)
+    dmean=delta.mean(axis=0)
+    meddelta=np.median(dmean)
+    maddelta=np.median(np.abs(dmean-meddelta))
+    zdelta=(dmean-meddelta)/maddelta
+
+    zfocality=zfocality.reindex(zdelta.index)
+
+    up_eligible=zfocality[ (zfocality  > 2.5) & (zdelta > 2.5) ].index
+    dn_eligible=zfocality[ (zfocality  < -2.5) & (zdelta < -2) ].index
+    #downfocal=focality[ focality < (medfocality-2.5*madfocality) ].index
+    #upfocal=focality[ focality > (medfocality+2.5*madfocality) ].index
+
+    up=pd.DataFrame(index=merc.index,columns=up_eligible,data=(delta[up_eligible]>=4).values).rename(columns=lambda c : c+'_up')
+    dn=pd.DataFrame(index=merc.index,columns=dn_eligible,data=(delta[dn_eligible]<=-1).values).rename(columns=lambda c : c+'_dn')
+
+    #cna=pd.merge(up,dn,suffixes=['_up','_dn'],left_index=True,right_index=True)
+    cna=up.join(dn,how='outer')
+
+    if return_extra : 
+        return females,merc,delta,focality,cna
+    else :
+        return cna
+
+
+def process_cna_group_old(cnapaths,sampsheet,merge=True) : 
+    # "old" meaning prior to 2/22/24
     start=time.time()
     #msg('Reading...')
     with mp.Pool(processes=int(3*len(os.sched_getaffinity(0))//4)) as p : 
@@ -133,15 +263,21 @@ def process_cna_group(cnapaths,sampsheet) :
     #merc=merc.set_index('simple_case_id',drop=True)
     #msg('{: >10.2f}'.format(time.time()-start))
     #merc=merc.fillna(merc.median(axis=2))
-    merc=merc.fillna(2.0)
+    #merc=merc.fillna(0.0)
+
+
+
     #msg('Breaking into up/dn...')
-    up=pd.DataFrame(index=merc.index,columns=merc.columns,data=np.where(merc.values >=4 ,True,False))
-    dn=pd.DataFrame(index=merc.index,columns=merc.columns,data=np.where(merc.values <=1 ,True,False))
     #msg('{: >10.2f}'.format(time.time()-start))
     #msg('Merging up/dn...')
-    cna=pd.merge(up,dn,suffixes=['_up','_dn'],left_index=True,right_index=True)
-    #msg('{: >10.2f}'.format(time.time()-start))
-    return cna
+    if not merge : 
+        return merc
+    else: 
+        up=pd.DataFrame(index=merc.index,columns=merc.columns,data=np.where(merc.values >=4 ,True,False))
+        dn=pd.DataFrame(index=merc.index,columns=merc.columns,data=np.where(merc.values <=1 ,True,False))
+        cna=pd.merge(up,dn,suffixes=['_up','_dn'],left_index=True,right_index=True)
+        #msg('{: >10.2f}'.format(time.time()-start))
+        return cna
 
 _consequential_mutations={'NMD_transcript_variant',
  'missense_variant',
@@ -349,6 +485,13 @@ def expandgfftags(tagstring) :
     return td
 
 @np.vectorize
+def expand_xrefs(xrefstring) : 
+    xrefs=[ xr.split(':')[-2:] for xr in xrefstring.split(',') ]
+    xrd=dict(xrefs)
+
+    return xrd
+
+@np.vectorize
 def acc_to_chr(x) : 
     xsp=x.split('.')[0].split('0')
     chrno=xsp[-1]
@@ -359,7 +502,7 @@ def acc_to_chr(x) :
     if chrno == '24' : 
         return 'chrY'
     return 'chr'+chrno
-        
+
 
 
 def generate_cn_signatures(segfilepath,jobroot) : 
@@ -375,9 +518,52 @@ def generate_cn_signatures(segfilepath,jobroot) :
             make_plots=False,
             )
 
+def _prep_gff_for_cna(subset=None) : 
+    global _gff
+    if _gff is None : 
+        _gff=load_gff()
+
+    proscribed={ 'exon','mRNA','match','pseudogene','CDS'}
+
+    gffg=_gff.dropna(subset='tags').query('kind not in @proscribed')
+
+    gffg=gffg.join(pd.DataFrame.from_records(expandgfftags(gffg.tags),index=gffg.index))
+    gffg=gffg.dropna(subset='Dbxref')
+    gffg=gffg.join(pd.DataFrame.from_records(expand_xrefs(gffg.Dbxref),index=gffg.index))
+    if subset is None : 
+        pass
+    else : 
+        gffg=gffg.query("GeneID in @subset")
+
+    srccats=[
+        'BestRefSeq',
+        'RefSeq',
+        'BestRefSeq%2CGnomon',
+        'Gnomon',
+        'cmsearch',
+        'tRNAscan-SE',
+        'Curated Genomic',
+        ]
+
+    gffg['src']=pd.Categorical(gffg.src.values,categories=srccats)
+    #gffg['Chr']=acc_to_chr(gffg.acc)
+
+    gffgu=gffg.dropna(subset='GeneID').sort_values(['src','GeneID']).drop_duplicates('GeneID',keep='first').set_index('GeneID')
+
+    return gffgu
+        
+
+def load_gff() : 
+    global _gff
+    _gff=pd.read_csv('/cellar/users/mrkelly/Data/canon/ncbi_reference/GRCh38_latest_genomic.gff',sep='\t',comment='#',names=['acc','src','kind','start','stop','foo1','strand','foo2','tags'])
+    return _gff
+
 def load_gene_regions() : 
-    gff=pd.read_csv('/cellar/users/mrkelly/Data/canon/ncbi_reference/GRCh38_latest_genomic.gff',sep='\t',comment='#',names=['acc','src','kind','start','stop','foo1','strand','foo2','tags'])
-    gff=gff[ gff.tags.str.contains('genome=chromosome') | gff.kind.eq('centromere') ]
+    global _gff
+    if _gff is None : 
+        load_gff()
+
+    gff=_gff[ _gff.tags.str.contains('genome=chromosome') | _gff.kind.eq('centromere') ]
     gffp=gff.pivot_table(index='acc',columns='kind',values=['stop','start'])
     gffp[('other','chr')]=acc_to_chr(gffp.index)
     return gffp

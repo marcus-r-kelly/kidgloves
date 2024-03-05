@@ -13,6 +13,9 @@ import torch
 from concurrent import futures
 from functools import reduce
 from tqdm.auto import tqdm
+import sys
+import time
+
 opj=os.path.join
 
 def deepunpickle(fn) : 
@@ -38,7 +41,7 @@ rakws=[
         'main',
         'matched_null',
         'burnin',
-        'boot',
+#        'boot',
         'settings',
         'X',
         'boot_X',
@@ -50,6 +53,7 @@ rakws=[
         'ofinterest',
         'path',
         'hier',
+        'etype',
         ]
 
 def _unpack_arrays(npzpath) :
@@ -94,18 +98,20 @@ def taic(w,i,X,y,n) :
             )
 
 def modgen(ra) : 
-    paths=[ 'main','null' ]+[ opj(ra.path,subf) for subf in os.listdir(ra.path) if os.path.isdir(opj(ra.path,subf)) ] 
+    paths=[ 'main','null' ]+[ subf for subf in os.listdir(ra.path) if os.path.isdir(opj(ra.path,subf)) ] 
 
     for p in paths : 
         match p : 
             case 'xval' :
-                pass
+                for pt in os.listdir(opj(ra.path,p)) : 
+                    if not pt.startswith('xval_full_') : continue
+                    yield (pt.split('.')[0],torch.load(opj(ra.path,p,pt),map_location=torch.device('cpu')),ra.X,ra.y,ra.n)
             case 'main' : 
                 yield ('main',ra.main,ra.X,ra.y,ra.n)
             case 'null' : 
                 yield ('null',ra.matched_null,largesse_g.mask_sparse_columns(ra.X,torch.tensor(ra.featuretypes != 'system',dtype=torch.bool)),ra.y,ra.n)
             case _ : 
-                yield (p,torch.load(opj(ra.path,p,'logger.pt')),torch.load(opj(ra.path,p,'spX.pt'),map_location=torch.device('cpu')),ra.y,ra.n)
+                yield (p,torch.load(opj(ra.path,p,'logger.pt'),map_location=torch.device('cpu')),torch.load(opj(ra.path,p,'spX.pt'),map_location=torch.device('cpu')),ra.y,ra.n)
 
 def score_optres_and_x(p,optres,X,y,n) : 
 
@@ -121,7 +127,7 @@ def score_optres_and_x(p,optres,X,y,n) :
 def lowest_of_path(path) : 
     return [ d for d in path.split(os.sep) if len(d) > 0 ][-1]
 
-def score_ensemble(ra) :
+def score_ensemble(ra,monitor=False) :
 
     flags=list()
     aicreses=list()
@@ -129,12 +135,17 @@ def score_ensemble(ra) :
     n_sig_genes=list()
     n_sig_systems=list()
     n_sig_signatures=list()
+    convergence_stati=list()
 
     n_genes_in_matrix=(ra.featuretypes == 'gene').sum()
     n_signatures_in_matrix=(( ra.featuretypes != 'system' ) & (ra.featuretypes != 'gene') ).sum()
 
+    if monitor : starttime=time.time()
 
-    for guts in modgen(ra) : 
+
+    for e,guts in enumerate(modgen(ra)) : 
+        if monitor : print('{:0>4} : {: >30} ({:0>4d}s)'.format(e,guts[0],int(time.time()-starttime)),end='\r') ; sys.stdout.flush()
+
         flags.append(lowest_of_path(guts[0]).split('_')[0])
         nsystems_this_h=guts[2].shape[1]
         gutssizes.append(nsystems_this_h)
@@ -150,6 +161,7 @@ def score_ensemble(ra) :
         n_sig_systems.append(len(bwoi) - nsgenes_this - nssignatures_this)
 
         aicreses.append(score_optres_and_x(*guts))
+        convergence_stati=guts[1].convergence_status
 
     fr=pd.DataFrame(aicreses)
     fr=fr.assign(model_type=flags)
@@ -158,7 +170,10 @@ def score_ensemble(ra) :
                  n_sig_genes=n_sig_genes,
                  n_sig_systems=n_sig_systems,
                  n_sig_signatures=n_sig_signatures,
+                 convergence_status=convergence_stati
                  )
+    if monitor : print()
+
     return fr
 
 def best_of_or(optres) : 
@@ -166,10 +181,6 @@ def best_of_or(optres) :
     wt=optres.weight[bwi]
     i=optres.intercept[bwi]
     return wt,i
-
-
-
-
 
 
 class RunAnalysis(object) : 
@@ -201,21 +212,27 @@ class RunAnalysis(object) :
 
     def from_dir(path) : 
 
-        mr=torch.load(kg.opj(path,'main.pt'))
-        mn=torch.load(kg.opj(path,'matched_null.pt'))
-        bir=torch.load(kg.opj(path,'burnin.pt'))
-        boot=torch.load(kg.opj(path,'boot.pt'))
-        settings=torch.load(kg.opj(path,'settings.pt'))
+
+        mr=torch.load(kg.opj(path,'main.pt'),map_location=torch.device('cpu'))
+        mn=torch.load(kg.opj(path,'matched_null.pt'),map_location=torch.device('cpu'))
+        if os.path.exists(kg.opj(path,'burnin.pt')) : 
+            bir=torch.load(kg.opj(path,'burnin.pt'),map_location=torch.device('cpu'))
+            bioi=bir.ofinterest
+        else : 
+            bioi=list()
+        #boot=torch.load(kg.opj(path,'boot.pt'))
+        settings=torch.load(kg.opj(path,'settings.pt'),map_location=torch.device('cpu'))
         npz=np.load(kg.opj(path,'arrays.npz'),allow_pickle=True)
-        X=torch.load(kg.opj(path,'X.pt'))
+        X=torch.load(kg.opj(path,'X.pt'),map_location=torch.device('cpu'))
         with open(settings.hierarchy_path,'rb') as f : 
             hier=pickle.load(f)
+
 
         wx=largesse_g.mask_sparse_columns(
                 X,
                 torch.isin(
                     torch.arange(X.shape[1]),
-                    torch.tensor(bir.ofinterest)
+                    torch.tensor(bioi)
                 )
             )
 
@@ -228,10 +245,12 @@ class RunAnalysis(object) :
                 ofinterest=npz['ofinterest_full'],
                 )
 
+        arrays.update(etype=np.vectorize(lambda s : s.split('_')[1])(arrays['ylabels']))
+
         return RunAnalysis(main=mr,
                     matched_null=mn,
                     burnin=bir,
-                    boot=boot,
+                    #boot=boot,
                     settings=settings,
                     X=X,
                     boot_X=wx,
@@ -244,7 +263,14 @@ class RunAnalysis(object) :
         return torch.special.expit(self.predict_odds(weights,intercept))
 
     def predict_odds(self,weights,intercept) : 
-        if len(self.weights) < self.X.shape[1] : 
+
+        if not torch.is_tensor(weights) : 
+            weights=torch.tensor(weights)
+
+        if not torch.is_tensor(intercept) : 
+            intercept=torch.tensor(intercept)
+
+        if len(weights) < self.X.shape[1] : 
             return torch.matmul(self.wx,weights)+intercept
         else: 
             return torch.matmul(self.X,weights)+intercept
@@ -253,12 +279,25 @@ class RunAnalysis(object) :
     def best_main(self) : 
         return best_of_or(self.main)  
 
-    def get_feature_stats(self) : 
+    def get_feature_stats(self,omics=None) : 
+
+        if not hasattr(self,'xvalmat'): 
+            self.assemble_xval_summary(omics=omics)
 
         bw,bi=self.best_main()
         bwargs=np.argwhere( bw > 0).ravel()
 
         featindices=np.arange(self.X.shape[1])
+
+        stability=((self.xvalmat >= bw*0.5 ) & (self.xvalmat <= bw*2)).sum(axis=0)/self.xvalmat.shape[0]
+
+        xi=self.X.indices().numpy()
+
+        yifi=list()
+        for fi in featindices : 
+            yithisfi=np.unique(xi[0][(xi[1] == fi)])
+            yifi.append(self.y[yithisfi].sum().item())
+
 
         fsfr=pd.DataFrame(index=self.feats)
         fsfr=fsfr.assign(
@@ -268,21 +307,14 @@ class RunAnalysis(object) :
                 in_burnin=np.isin(featindices,self.burnin.ofinterest),
                 in_final_model=np.isin(featindices,bwargs),
                 in_mn_model=np.isin(featindices,np.argwhere(self.matched_null.weight[self.matched_null.loss.argmin()] > 0)).ravel(),
-                nmembers=(self.X.to_dense() > 0).sum(axis=0).numpy(),
+                nmembers=[ (xi[1] ==x).sum() for x in range(self.X.shape[1]) ],
+                nevents=yifi,
+                stability=stability,
+                value=bw,
+                frac_nz=(self.xvalmat > 0).sum(axis=0)/self.xvalmat.shape[0],
+                average=self.xvalmat.mean(axis=0),
+                median=np.median(self.xvalmat,axis=0),
                 )
-
-        stability=((self.boot >= bw[self.ofinterest]*0.5 ) & (self.boot <= bw[self.ofinterest]*2)).sum(axis=0)/self.boot.shape[0]
-
-        sp_fsfr=pd.DataFrame(index=fsfr.index[self.ofinterest])
-        sp_fsfr=sp_fsfr.assign(
-                    value=bw[self.ofinterest],
-                    frac_nz=(self.boot > 0).sum(axis=0)/self.boot.shape[0],
-                    average=self.boot.mean(axis=0),
-                    median=np.median(self.boot,axis=0),
-                    stability=stability)
-
-        fsfr=fsfr.join(sp_fsfr,how='left').fillna(0)
-
 
         self.feature_stats=fsfr
         return self.feature_stats
@@ -336,46 +368,51 @@ class RunAnalysis(object) :
 
         return edgeframe,nodeframe
 
-    def assemble_xval_summary(self,omics) : 
+    def assemble_xval_summary(self,omics=None) : 
 
+        if omics is None : 
+            omics=pd.read_csv(self.settings.omics_path,index_col=0)
         xvaldir=kg.opj(self.settings.output_directory,'xval')
         splits=sorted([ fn for fn  in os.listdir(xvaldir) if fn.startswith('splits_') ])
         X=self.X
 
-        nullmask=(self.featuretypes != 'system')
-        Xn=largesse_g.mask_sparse_columns(X,torch.tensor(nullmask))
+        #nullmask=(self.featuretypes != 'system')
+        #Xn=largesse_g.mask_sparse_columns(X,torch.tensor(nullmask))
+
         xval_summary_data=list()
+        xval_term_data=list()
 
         for sp in splits: 
             spno=sp.split('.')[0].split('_')[1]
-            tr,te=torch.load(os.path.join(xvaldir,sp))
-            orfull=torch.load(os.path.join(xvaldir,'xval_full_'+spno+'.pt'))
-            ornull=torch.load(os.path.join(xvaldir,'xval_null_'+spno+'.pt'))
-            ytr=omics.reindex(tr).sum().reindex(self.ylabels).fillna(0)
-            yte=omics.reindex(te).sum().reindex(self.ylabels).fillna(0)
+            tr,vale,te=torch.load(os.path.join(xvaldir,sp),map_location=torch.device('cpu'))
+            orfull=torch.load(os.path.join(xvaldir,'xval_full_'+spno+'.pt'),map_location=torch.device('cpu'))
+
+            yall=omics.sum(axis=0).reindex(self.ylabels).fillna(0)
+            yte=omics.reindex(omics.index[te]).sum().reindex(self.ylabels).fillna(0)
+
+            bw,bi=best_of_or(orfull)
+            xval_term_data.append(bw)
             
-            stats_full_tr=score_optres_and_x(xvaldir,orfull,X,ytr,len(tr))
-            stats_full_te=score_optres_and_x(xvaldir,orfull,X,yte,len(te))
-            stats_null_tr=score_optres_and_x(xvaldir,ornull,Xn,ytr,len(tr))
-            stats_null_te=score_optres_and_x(xvaldir,ornull,Xn,yte,len(te))
+            stats_full_all   =   score_optres_and_x(xvaldir,orfull,  X,  yall,omics.shape[0])
+            stats_full_te    =   score_optres_and_x(xvaldir,orfull,  X,  yte,len(te))
             
-            results=[ stats_full_tr, stats_full_te, stats_null_tr, stats_null_te, ]
-            modelclasses=['full','full','null','null']
-            patientgroups=['train','test','train','test']
+            results=[ stats_full_all, stats_full_te,]
+            patientgroups=['all','test',]
             
             subf=pd.DataFrame(results)
-            subf['modelclasses']=modelclasses
             subf['patient_groups']=patientgroups
             subf['fold']=spno
             
             xval_summary_data.append(subf)
 
         xvdf=pd.concat(xval_summary_data).reset_index(drop=True)
-        xvdfp=xvdf.pivot(index=['fold','patient_groups'],columns='modelclasses',values='criterion')
-        xvdf=xvdf.merge((xvdfp.full-xvdfp.null).rename('dAIC').reset_index(),on=['fold','patient_groups'],how='left')    
+        #xvdfp=xvdf.pivot(index=['fold','patient_groups'],columns='modelclasses',values='criterion')
+        #xvdf=xvdf.merge((xvdfp.full-xvdfp.null).rename('dAIC').reset_index(),on=['fold','patient_groups'],how='left')    
 
+        xvalmat=np.c_[*xval_term_data].transpose()
+        self.xvalmat=xvalmat
         self.xvdf=xvdf
-        return xvdf
+        return xvdf,xvalmat
 
 
 def is_possible_child(hier,parent,child) :
@@ -447,8 +484,12 @@ def h2ctf(h) :
 
 class palette() : 
     def __init__(self,**kwargs) : 
+        self.colornames=list()
         for k in kwargs : 
+            self.colornames.append(k)
             self.__setattr__(k,kwargs[k])
+    def __repr__(self) : 
+            return '\n'.join(['{}={}'.format(k,getattr(self,k)) for k in self.colornames])
 
 spots=palette(      
     vermillion="#E91E25",
@@ -500,7 +541,7 @@ fuscm=LinearSegmentedColormap.from_list('fus_over_cohort',[(1.0,1.0,1.0),h2ctf(f
 def pivot_event_classes(ra) : 
 
     if kg._e2s is None : 
-        kg.get_geneinfo()
+        kg._get_geneinfo()
 
     e2s=kg._e2s
 
@@ -509,7 +550,7 @@ def pivot_event_classes(ra) :
     omicscounts['event_class']=omicscounts.event_name.apply(lambda x : x.split('_')[1])
     omicscounts['symbol']=omicscounts.eid.apply(e2s.get)
 
-    ocpiv=omicscounts.pivot_table(index='symbol',columns='event_class',values='event_counts').fillna(0)
+    ocpiv=omicscounts.pivot_table(index='symbol',columns='event_class',values='event_counts').astype(np.float64).fillna(0.0).astype(int)
     occounts=ocpiv.sum(axis=1)
     occounts=occounts[occounts.gt(1)]
     occounts=occounts.sort_values(ascending=True)
@@ -597,4 +638,7 @@ def onco_hbar_split(ocpiv,figsize=(0.5,3),transition=15) :
 
 def stripsuf(s) : 
     return s.split('_')[0]
+
+def strippref(s) : 
+    return s.split('_')[1]
 
